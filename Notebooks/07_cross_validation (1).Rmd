@@ -1,0 +1,938 @@
+---
+title: "07 - Validazione incrociata a finestra espansiva"
+subtitle: "Inflazione Italia - Analisi Econometrica"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Chunk: setup
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)   # manipolazione dati e grafici
+library(tsibble)     # gestione serie temporali tidy
+library(here)        # percorsi ancorati alla cartella del progetto
+library(urca)        # ca.jo(): test di cointegrazione, ristimato a ogni finestra
+library(lmtest)      # coeftest(): test di Diebold-Mariano
+library(sandwich)    # NeweyWest(): varianza HAC
+```
+
+# Obiettivo del notebook
+
+Il confronto del notebook 06 si è concluso con un problema di **potenza
+statistica**: su 44 osservazioni il test di Diebold-Mariano non ha rifiutato
+nessuna ipotesi nulla, lasciando tutte le differenze fra modelli formalmente
+inconcludenti. L'unico risultato vicino alla soglia — l'ECM peggiore
+dell'ARIMA parsimonioso sul MAE, p = 0.0501 — è rimasto sospeso per un
+millesimo.
+
+Il limite non è nei modelli ma nel **disegno di valutazione**: un unico taglio
+train/test produce tanti errori di previsione quante sono le osservazioni del
+test set, e 44 sono poche per distinguere differenze modeste dal rumore.
+
+La validazione incrociata a finestra espansiva risolve questo problema.
+L'idea: invece di stimare una volta sola e prevedere 44 mesi, si ripete
+l'intero esercizio centinaia di volte, avanzando di un mese alla volta.
+
+Il guadagno atteso è sostanziale — circa **200 errori di previsione invece di
+44** — e con quella numerosità il test di Diebold-Mariano acquista una potenza
+reale. Le domande a cui si può finalmente rispondere:
+
+1. Il vantaggio dell'ARIMA parsimonioso è reale o è un artefatto del particolare
+   periodo 2023-2026?
+2. L'ECM è davvero peggiore, o il test set precedente gli è stato sfavorevole?
+3. L'ipotesi che l'ECM renda meglio nelle fasi di movimento — che nel notebook
+   06 si reggeva su otto osservazioni del 2026 — regge su un campione ampio?
+
+# Come funziona la finestra espansiva
+
+Il meccanismo, ripetuto per ogni mese a partire da un'origine iniziale:
+
+1. si prendono tutti i dati disponibili **fino al mese t**;
+2. su quei dati si **ristima tutto da capo**: il vettore di cointegrazione di
+   Johansen, i coefficienti degli ECM, i coefficienti degli ARIMA;
+3. si prevede il mese **t+1**, che il modello non ha mai visto;
+4. si registra l'errore;
+5. si avanza di un mese e si ricomincia, con la finestra di stima più lunga di
+   una osservazione.
+
+È la simulazione fedele di un previsore reale che ogni mese aggiorna il proprio
+modello con i dati appena pubblicati e produce la stima del mese successivo.
+
+**La differenza cruciale rispetto al notebook 06** è che qui i parametri vengono
+**ristimati a ogni passo**, non congelati a dicembre 2022. Nessuna previsione
+usa mai informazione successiva alla propria data: non c'è alcuna forma di
+look-ahead.
+
+**Il vettore di cointegrazione viene ristimato a ogni finestra.** È il punto
+metodologicamente più delicato di questo notebook. Riutilizzare il β stimato
+sull'intero training set avrebbe significato, per le finestre iniziali, usare
+una relazione di lungo periodo calcolata anche su dati futuri rispetto alla
+previsione — una contaminazione sottile ma reale. Ristimare Johansen ogni volta
+costa tempo di calcolo, ma è l'unica scelta corretta.
+
+# Caricamento e preparazione
+
+```{r caricamento_dati}
+# Chunk: caricamento_dati
+df_train <- readRDS(here("Data", "Processed", "df_train.rds"))
+df_test  <- readRDS(here("Data", "Processed", "df_test.rds"))
+
+# Serie completa in livello: train + test. Qui non esiste piu' la distinzione,
+# perche' il taglio train/test viene rifatto a ogni iterazione.
+serie <- bind_rows(
+  df_train %>% as_tibble(),
+  df_test  %>% as_tibble()
+) %>%
+  arrange(date) %>%
+  mutate(date = yearmonth(date))
+
+# Differenze: si calcolano UNA SOLA VOLTA sull'intera serie, perche' la
+# trasformazione di un'osservazione non dipende dalla finestra di stima
+# (d_hicp_it di marzo 2010 e' sempre la stessa, comunque si tagli il campione).
+serie_diff <- serie %>%
+  mutate(
+    d_hicp_it  = hicp_it - dplyr::lag(hicp_it),
+    d_hicp_ea  = hicp_ea - dplyr::lag(hicp_ea),
+    dlog_brent = log(brent) - log(dplyr::lag(brent))
+  )
+
+cat("Serie completa:", nrow(serie), "osservazioni |",
+    as.character(min(serie$date)), "->", as.character(max(serie$date)), "\n")
+```
+
+```{r configurazione_cv}
+# Chunk: configurazione_cv
+# ORIGINE INIZIALE: la prima finestra di stima arriva a dicembre 2009, cioe'
+# 13 anni di dati. E' un compromesso: abbastanza osservazioni perche' il test
+# di Johansen e gli ARIMA stagionali siano stimabili in modo affidabile, ma
+# abbastanza presto da lasciare un numero elevato di previsioni da valutare.
+origine_iniziale <- yearmonth("2009-12")
+
+# Specificazioni ECM da valutare (le stesse del notebook 06)
+specifiche_ecm <- list(
+  ECM_A5 = c("ECT_l1", "d_hicp_it_l1", "d_hicp_ea_l1", "d_hicp_it_l12"),
+  ECM_A8 = c("ECT_l1", "d_hicp_it_l1", "d_hicp_it_l2", "d_hicp_ea_l1",
+             "d_hicp_it_l12", "dlog_brent_l1")
+)
+
+# Ordini ARIMA fissati (selezionati nel notebook 04). A ogni finestra vengono
+# ristimati i COEFFICIENTI, non riselezionati gli ordini: riselezionarli ogni
+# volta renderebbe l'esercizio molto piu' lento e non e' pratica standard.
+ordini_arima <- list(
+  arima_auto         = list(pdq = c(1, 1, 3), PDQ = c(0, 0, 2)),
+  arima_parsimonioso = list(pdq = c(0, 1, 2), PDQ = c(0, 0, 1))
+)
+
+origini <- serie$date[serie$date >= origine_iniziale &
+                      serie$date <  max(serie$date)]
+
+cat("Origini di previsione:", length(origini), "\n")
+cat("Prima previsione:", as.character(origini[1] + 1), "\n")
+cat("Ultima previsione:", as.character(max(serie$date)), "\n")
+```
+
+**Una limitazione da dichiarare.** Gli **ordini** degli ARIMA — (1,1,3)(0,0,2) e
+(0,1,2)(0,0,1) — sono stati selezionati nel notebook 04 usando dati fino a
+dicembre 2022, che si sovrappongono al periodo di valutazione della
+cross-validation. A rigore è una lieve forma di look-ahead. Riselezionare gli
+ordini a ogni finestra sarebbe più puro ma moltiplicherebbe il tempo di calcolo
+per un fattore elevato, e non è pratica comune in letteratura. Lo stesso vale
+per la scelta delle due specificazioni ECM. Va dichiarato fra i limiti: il
+confronto **fra** i modelli resta valido, perché la stessa concessione è fatta
+a tutti.
+
+# Esecuzione della validazione incrociata
+
+```{r funzione_un_passo}
+# Chunk: funzione_un_passo
+# Esegue UNA iterazione: stima tutto sui dati fino a t, prevede t+1.
+un_passo_cv <- function(t, serie, serie_diff, specifiche, ordini) {
+
+  idx_t <- which(serie$date == t)
+  if (idx_t >= nrow(serie)) return(NULL)
+  t_succ <- serie$date[idx_t + 1]
+
+  # --- 1. Johansen ristimato sui soli dati fino a t ---
+  sistema <- serie %>%
+    dplyr::filter(date <= t) %>%
+    transmute(
+      hicp_it   = as.numeric(hicp_it),
+      hicp_ea   = as.numeric(hicp_ea),
+      log_brent = as.numeric(log(brent))
+    ) %>%
+    tidyr::drop_na() %>%
+    dplyr::filter(is.finite(log_brent)) %>%
+    as.matrix()
+
+  jo   <- tryCatch(ca.jo(sistema, type = "trace", ecdet = "const", K = 2),
+                   error = function(e) NULL)
+  if (is.null(jo)) return(NULL)
+  beta <- jo@V[, 1]
+
+  # --- 2. ECT e regressori ritardati, calcolati col beta di QUESTA finestra ---
+  dati <- serie_diff %>%
+    mutate(
+      ECT = hicp_it * beta[1] + hicp_ea * beta[2] +
+            log(brent) * beta[3] + beta[4]
+    ) %>%
+    mutate(
+      ECT_l1        = dplyr::lag(ECT, 1),
+      d_hicp_it_l1  = dplyr::lag(d_hicp_it, 1),
+      d_hicp_it_l2  = dplyr::lag(d_hicp_it, 2),
+      d_hicp_ea_l1  = dplyr::lag(d_hicp_ea, 1),
+      d_hicp_it_l12 = dplyr::lag(d_hicp_it, 12),
+      dlog_brent_l1 = dplyr::lag(dlog_brent, 1),
+      hicp_it_l1    = dplyr::lag(hicp_it, 1)
+    )
+
+  riga_prev <- dati %>% dplyr::filter(date == t_succ)
+  osservato <- riga_prev$hicp_it
+
+  # --- 3. ECM: stima su dati <= t, previsione su t+1 ---
+  ris_ecm <- imap(specifiche, function(regs, nome) {
+    dati_fit <- dati %>%
+      dplyr::filter(date <= t) %>%
+      tidyr::drop_na(all_of(c("d_hicp_it", regs)))
+
+    mod <- tryCatch(lm(reformulate(regs, response = "d_hicp_it"), data = dati_fit),
+                    error = function(e) NULL)
+
+    prev <- if (is.null(mod)) NA_real_ else {
+      riga_prev$hicp_it_l1 + as.numeric(predict(mod, newdata = riga_prev))
+    }
+    tibble(modello = nome, previsto = prev)
+  }) %>% list_rbind()
+
+  # --- 4. ARIMA: coefficienti ristimati, ordini fissi ---
+  y <- serie %>% dplyr::filter(date <= t) %>% pull(hicp_it) %>% as.numeric()
+
+  ris_arima <- imap(ordini, function(ord, nome) {
+    fit <- tryCatch(
+      stats::arima(stats::ts(y, frequency = 12),
+                   order    = ord$pdq,
+                   seasonal = list(order = ord$PDQ, period = 12),
+                   method   = "CSS-ML"),
+      error = function(e) NULL
+    )
+    prev <- if (is.null(fit)) NA_real_ else as.numeric(predict(fit, n.ahead = 1)$pred)
+    tibble(modello = nome, previsto = prev)
+  }) %>% list_rbind()
+
+  # --- 5. Naive: il valore osservato in t ---
+  ris_naive <- tibble(modello = "Naive", previsto = tail(y, 1))
+
+  bind_rows(ris_ecm, ris_arima, ris_naive) %>%
+    mutate(date = t_succ, osservato = osservato, .before = 1)
+}
+```
+
+```{r esecuzione_cv}
+# Chunk: esecuzione_cv
+# ATTENZIONE: questo chunk e' lento (qualche minuto): esegue ~200 iterazioni,
+# ognuna con un test di Johansen e quattro stime. Il risultato viene salvato su
+# disco: alle esecuzioni successive viene ricaricato invece di essere ricalcolato.
+# Per forzare il ricalcolo, metti ricalcola_cv <- TRUE oppure cancella il file.
+percorso_cv   <- here("Data", "Processed", "risultati_cv.rds")
+ricalcola_cv  <- FALSE
+
+if (file.exists(percorso_cv) && !ricalcola_cv) {
+
+  risultati_cv <- readRDS(percorso_cv)
+  cat("Risultati caricati da disco:", nrow(risultati_cv), "righe\n")
+
+} else {
+
+  cat("Esecuzione della cross-validation in corso...\n")
+  inizio <- Sys.time()
+
+  risultati_cv <- map(origini, function(t) {
+    un_passo_cv(t, serie, serie_diff, specifiche_ecm, ordini_arima)
+  }, .progress = TRUE) %>%
+    list_rbind()
+
+  saveRDS(risultati_cv, percorso_cv)
+
+  cat("Completata in", round(difftime(Sys.time(), inizio, units = "mins"), 1),
+      "minuti\n")
+}
+
+# Errori di previsione e pulizia delle eventuali iterazioni fallite
+cv <- risultati_cv %>%
+  tidyr::drop_na(osservato, previsto) %>%
+  mutate(errore = osservato - previsto)
+
+cat("Previsioni valutate per modello:\n")
+cv %>% count(modello) %>% print()
+cat("\nPeriodo coperto:", as.character(min(cv$date)), "->",
+    as.character(max(cv$date)), "\n")
+```
+
+# Metriche complessive
+
+```{r metriche_cv}
+# Chunk: metriche_cv
+metriche_cv <- cv %>%
+  group_by(modello) %>%
+  summarise(
+    n    = n(),
+    RMSE = round(sqrt(mean(errore^2)), 4),
+    MAE  = round(mean(abs(errore)), 4),
+    ME   = round(mean(errore), 4),
+    .groups = "drop"
+  ) %>%
+  arrange(RMSE) %>%
+  mutate(
+    RMSE_rel = round(RMSE / RMSE[modello == "Naive"], 3),
+    MAE_rel  = round(MAE  / MAE[modello == "Naive"], 3)
+  )
+
+metriche_cv
+```
+
+**Le colonne relative sono le più leggibili.** `RMSE_rel` e `MAE_rel` esprimono
+l'errore di ciascun modello come frazione di quello del random walk: un valore
+di 0.90 significa un errore del 10% inferiore al naive, un valore superiore a 1
+significa che il modello è **peggio di non fare nulla**.
+
+È la metrica standard nella letteratura sulla previsione dell'inflazione
+(spesso chiamata *relative RMSE*), e rende i risultati direttamente
+confrontabili con quelli pubblicati in altri studi.
+
+## Interpretazione
+
+| Modello | n | RMSE | MAE | ME | RMSE_rel | MAE_rel |
+|---|---|---|---|---|---|---|
+| **ECM_A5** | 200 | **0.4858** | 0.3297 | −0.0456 | **0.860** | 0.963 |
+| ECM_A8 | 200 | 0.4903 | 0.3283 | −0.0420 | 0.868 | 0.959 |
+| arima_parsimonioso | 200 | 0.5091 | **0.3226** | 0.0085 | 0.901 | **0.942** |
+| arima_auto | 200 | 0.5166 | 0.3318 | −0.0087 | 0.914 | 0.969 |
+| Naive | 200 | 0.5650 | 0.3425 | 0.0105 | 1.000 | 1.000 |
+
+**Su 200 previsioni la classifica dell'RMSE si ribalta rispetto al notebook
+06.** I due ECM occupano il primo e il secondo posto, seguiti dai due ARIMA, con
+il random walk ultimo. `ECM_A5` riduce l'RMSE del **14.0% rispetto al naive** e
+del 4.6% rispetto al miglior ARIMA.
+
+**Questo non contraddice il notebook 06: lo completa.** Il notebook 06 valutava
+esclusivamente il periodo 2023-2026, e la tabella per regime più sotto conferma
+che in quel sotto-periodo l'ARIMA parsimonioso vince davvero. Su un orizzonte di
+vent'anni, però, i guadagni dell'ECM in altre fasi superano quella perdita. Le
+due conclusioni sono entrambe corrette nei rispettivi campi di validità, e il
+confronto fra le due è di per sé un risultato: **la classifica dei modelli
+dipende dal periodo di valutazione**, e un singolo taglio train/test può
+restituire un'immagine non rappresentativa.
+
+**Il MAE racconta una storia diversa e più piatta.** L'ARIMA parsimonioso resta
+il migliore (0.3226), ma l'intervallo fra il primo e l'ultimo modello è
+strettissimo: da 0.3226 a 0.3425, appena il 6%. Sulla perdita assoluta i cinque
+modelli sono sostanzialmente equivalenti.
+
+La divergenza fra le due metriche ha una spiegazione precisa e importante: il
+vantaggio degli ECM è **concentrato negli errori grandi**. L'RMSE, che li
+penalizza quadraticamente, lo registra; il MAE, che tratta tutti gli errori allo
+stesso modo, lo diluisce fino a farlo sparire. Detto altrimenti: **gli ECM non
+prevedono meglio nel mese tipico, prevedono meglio nei mesi difficili.**
+
+**Il ME complessivo va letto con cautela.** Tutti i modelli mostrano una
+distorsione media vicina a zero (fra −0.046 e +0.011), il che sembrerebbe
+indicare assenza di bias sistematico.
+
+**Non è così**, e la scomposizione per regime più avanti lo dimostra: la media
+quasi nulla nasce dalla **compensazione fra periodi di segno opposto**. Nelle
+fasi di risalita dell'inflazione tutti i modelli la sottostimano (ME positivo);
+nella disinflazione 2023-2026 tutti la sovrastimano (ME negativo). Mediando
+sull'intero campione le due distorsioni si elidono, producendo un numero
+rassicurante che nasconde due bias reali di direzione opposta.
+
+È un esempio di perché le metriche aggregate vadano sempre scomposte: un ME
+prossimo a zero può significare "nessuna distorsione" oppure "due distorsioni
+che si annullano", e le due situazioni hanno implicazioni operative del tutto
+diverse.
+
+# Test di Diebold-Mariano sul campione esteso
+
+```{r test_dm_cv}
+# Chunk: test_dm_cv
+# Stessa implementazione del notebook 06, ma su ~200 osservazioni invece di 44.
+# ritardi = 6: con un campione piu' lungo conviene una finestra HAC piu' ampia
+# della precedente, per catturare eventuale autocorrelazione nei differenziali
+# di perdita senza perdere troppi gradi di liberta'.
+test_dm <- function(dati, mod1, mod2, potenza = 2, ritardi = 6) {
+
+  comuni <- dati %>%
+    dplyr::filter(modello %in% c(mod1, mod2)) %>%
+    dplyr::select(date, modello, errore) %>%
+    pivot_wider(names_from = modello, values_from = errore) %>%
+    tidyr::drop_na()
+
+  d     <- abs(comuni[[mod1]])^potenza - abs(comuni[[mod2]])^potenza
+  mod_d <- lm(d ~ 1)
+  ct    <- coeftest(mod_d, vcov = NeweyWest(mod_d, lag = ritardi, prewhite = FALSE))
+
+  tibble(
+    confronto  = paste(mod1, "vs", mod2),
+    perdita    = ifelse(potenza == 2, "quadratica (RMSE)", "assoluta (MAE)"),
+    n          = nrow(comuni),
+    diff_media = round(as.numeric(ct[1, "Estimate"]), 5),
+    stat_DM    = round(as.numeric(ct[1, "t value"]), 3),
+    p_value    = round(as.numeric(ct[1, "Pr(>|t|)"]), 4),
+    esito      = case_when(
+      as.numeric(ct[1, "Pr(>|t|)"]) < 0.01 ~ "Significativa all'1%",
+      as.numeric(ct[1, "Pr(>|t|)"]) < 0.05 ~ "Significativa al 5%",
+      as.numeric(ct[1, "Pr(>|t|)"]) < 0.10 ~ "Significativa al 10%",
+      TRUE                                  ~ "Non significativa"
+    )
+  )
+}
+
+# Tutte le coppie rilevanti, su entrambe le funzioni di perdita
+coppie <- list(
+  c("ECM_A5", "arima_parsimonioso"),
+  c("ECM_A5", "arima_auto"),
+  c("ECM_A5", "Naive"),
+  c("ECM_A8", "ECM_A5"),
+  c("arima_parsimonioso", "arima_auto"),
+  c("arima_parsimonioso", "Naive")
+)
+
+risultati_dm_cv <- map(coppie, function(cp) {
+  bind_rows(
+    test_dm(cv, cp[1], cp[2], potenza = 2),
+    test_dm(cv, cp[1], cp[2], potenza = 1)
+  )
+}) %>% list_rbind()
+
+risultati_dm_cv
+```
+
+**Come leggere il segno.** `diff_media` positivo significa che il **primo**
+modello ha perdita maggiore, cioè prevede **peggio**. Negativo significa che il
+primo modello prevede meglio.
+
+Con circa 200 osservazioni il test ha ora una potenza ragionevole: un esito
+"Non significativa" qui è molto più informativo che nel notebook 06, perché
+indica una reale somiglianza fra i modelli e non semplicemente la mancanza di
+dati per distinguerli.
+
+## Interpretazione
+
+| Confronto | Perdita | Differenza media | t | p-value |
+|---|---|---|---|---|
+| ECM_A5 vs arima_parsimonioso | quadratica | −0.0232 | −0.764 | 0.446 |
+| ECM_A5 vs arima_parsimonioso | assoluta | +0.0071 | +0.348 | 0.728 |
+| ECM_A5 vs arima_auto | quadratica | −0.0309 | −0.764 | 0.446 |
+| ECM_A5 vs arima_auto | assoluta | −0.0022 | −0.088 | 0.930 |
+| **ECM_A5 vs Naive** | quadratica | **−0.0833** | **−1.597** | **0.112** |
+| ECM_A5 vs Naive | assoluta | −0.0128 | −0.555 | 0.579 |
+| ECM_A8 vs ECM_A5 | quadratica | +0.0044 | +1.041 | 0.299 |
+| arima_parsimonioso vs arima_auto | quadratica | −0.0076 | −0.271 | 0.786 |
+
+**Nessuna differenza è statisticamente significativa, nemmeno con 200
+osservazioni.** Questo è di per sé il risultato più importante del notebook, e
+va preso sul serio invece che liquidato.
+
+**Perché una riduzione del 14% dell'RMSE non risulta significativa.** Sembra una
+contraddizione, ma non lo è, ed è il punto tecnico più sottile del lavoro. Il
+test di Diebold-Mariano non confronta gli RMSE complessivi: valuta se la
+**media** del differenziale di perdita mese per mese sia diversa da zero,
+tenendo conto della sua **variabilità**.
+
+Come mostra il grafico seguente, il vantaggio dell'ECM sul random walk non è
+distribuito uniformemente nel tempo ma concentrato in pochi mesi eccezionali.
+Il differenziale di perdita è quindi quasi sempre vicino a zero, con rare
+osservazioni molto grandi: una media diversa da zero, ma con una varianza
+altissima. Il rapporto fra le due — la statistica t — resta modesto.
+
+È la traduzione statistica di un'affermazione economicamente sensata: *l'ECM è
+sensibilmente migliore in circostanze rare, e indistinguibile dagli altri nel
+resto del tempo.* Con eventi rari servono campioni molto più lunghi di 200
+osservazioni per raggiungere la significatività convenzionale.
+
+**Il confronto più vicino alla soglia** è `ECM_A5` contro il naive (p = 0.112),
+significativo solo a un livello del 12%. La direzione è quella attesa e il
+margine sostanziale, ma formalmente resta inconcludente.
+
+**Il confronto fra i due ARIMA è ora chiuso.** Nel notebook 04
+`arima_auto` dominava di 35.6 punti di AICc; qui perde su entrambe le metriche
+(RMSE 0.5166 contro 0.5091, MAE 0.3318 contro 0.3226) senza che la differenza
+sia significativa. La lettura corretta è che i 35.6 punti di vantaggio
+in-sample **non si traducono in alcun vantaggio previsivo**, coerentemente con
+la diagnosi delle radici quasi cancellate del notebook 04.
+
+**Il confronto fra i due ECM è altrettanto chiuso**: A8 e A5 sono
+indistinguibili (p = 0.299 su RMSE, 0.607 su MAE), con A5 marginalmente avanti
+sull'RMSE e A8 sul MAE. La scelta fra i due, che nel notebook 05 era stata
+lasciata aperta, può essere risolta per parsimonia a favore di **A5**: quattro
+regressori invece di sei, a parità di performance.
+
+# Stabilità nel tempo: errore quadratico cumulato
+
+```{r grafico_cumulato}
+# Chunk: grafico_cumulato
+# Differenza cumulata di perdita quadratica rispetto al naive.
+# Una linea che scende = il modello sta accumulando vantaggio sul naive.
+# Una linea che sale  = sta accumulando svantaggio.
+# La PENDENZA in ogni punto dice dove il vantaggio si genera davvero.
+colori_modelli <- c(
+  ECM_A5             = "#0072B2",
+  ECM_A8             = "#56B4E9",
+  arima_auto         = "#D55E00",
+  arima_parsimonioso = "#E69F00"
+)
+
+perdita_naive <- cv %>%
+  dplyr::filter(modello == "Naive") %>%
+  dplyr::select(date, perdita_naive = errore) %>%
+  mutate(perdita_naive = perdita_naive^2)
+
+cv %>%
+  dplyr::filter(modello != "Naive") %>%
+  left_join(perdita_naive, by = "date") %>%
+  group_by(modello) %>%
+  arrange(date) %>%
+  mutate(diff_cumulata = cumsum(errore^2 - perdita_naive)) %>%
+  ungroup() %>%
+  ggplot(aes(x = as.Date(date), y = diff_cumulata, colour = modello)) +
+  geom_line(linewidth = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_colour_manual(values = colori_modelli) +
+  labs(title = "Perdita quadratica cumulata rispetto al random walk",
+       subtitle = "Sotto lo zero = il modello batte il naive. La pendenza indica dove guadagna.",
+       x = NULL, y = "Differenza cumulata", colour = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+**Perché questo grafico è il più informativo del notebook.** Le metriche
+aggregate dicono *quanto* un modello è migliore; questo grafico dice **quando**.
+
+La lettura è nella pendenza, non nel livello: un tratto in discesa significa
+che in quei mesi il modello sta guadagnando terreno sul naive, un tratto in
+salita che lo sta perdendo, un tratto piatto che i due si equivalgono.
+
+### Interpretazione: il vantaggio è concentrato, non distribuito
+
+Il grafico è la chiave di lettura di tutto il notebook, e mostra tre fasi
+nettamente distinte.
+
+**Dal 2010 al 2019 le quattro linee restano incollate allo zero**, e per un
+lungo tratto leggermente *sopra*. In un intero decennio nessun modello riesce a
+staccare il random walk, e a tratti fa marginalmente peggio. Con l'inflazione
+italiana stabile e vicina allo zero, la previsione ingenua è sostanzialmente
+imbattibile e qualunque struttura aggiuntiva è, nel migliore dei casi, neutra.
+
+**Dal 2020 al 2023 tutte le linee precipitano.** È qui che si genera
+integralmente il vantaggio misurato nella tabella aggregata. Le due linee blu
+degli ECM scendono più rapidamente delle arancioni degli ARIMA, distaccandole
+progressivamente durante la pandemia e lo shock energetico. Il crollo verticale
+verso la fine del 2023 corrisponde a un singolo mese — ottobre 2023, quando
+l'inflazione passò dal 5.6% all'1.8% — in cui il random walk sbagliò di quasi
+4 punti percentuali mentre gli altri modelli contennero l'errore.
+
+**Dal 2024 in poi le linee tornano piatte, con una leggera risalita.** Superata
+la turbolenza, i modelli smettono di guadagnare e anzi restituiscono qualcosa
+al naive.
+
+**La conclusione è netta**: praticamente tutto il vantaggio accumulato in
+vent'anni dai modelli econometrici sul random walk è prodotto in **tre anni su
+diciassette**, quelli fra il 2020 e il 2023. Negli altri quattordici anni il
+random walk è competitivo.
+
+Questo spiega perfettamente perché il test di Diebold-Mariano non rifiuta pur
+in presenza di un RMSE relativo di 0.860: un vantaggio reale ma concentrato in
+pochi mesi produce un differenziale di perdita con media diversa da zero e
+varianza enorme, quindi una statistica t modesta.
+
+Ed è anche la conferma su un campione ampio dell'ipotesi formulata nel notebook
+06 sulla base di otto sole osservazioni: **i modelli econometrici servono nelle
+fasi di turbolenza, non nelle fasi di quiete.** Quell'intuizione, che allora era
+esplorativa, qui trova un fondamento empirico solido.
+
+```{r grafico_rmse_mobile}
+# Chunk: grafico_rmse_mobile
+# RMSE su finestra mobile di 24 mesi: mostra l'evoluzione dell'accuratezza
+# assoluta di ciascun modello nel tempo.
+cv %>%
+  group_by(modello) %>%
+  arrange(date) %>%
+  mutate(rmse_mobile = sqrt(zoo::rollmean(errore^2, k = 24, fill = NA, align = "right"))) %>%
+  ungroup() %>%
+  tidyr::drop_na(rmse_mobile) %>%
+  ggplot(aes(x = as.Date(date), y = rmse_mobile, colour = modello)) +
+  geom_line(linewidth = 0.8) +
+  scale_colour_manual(values = c(colori_modelli, Naive = "grey60")) +
+  labs(title = "RMSE su finestra mobile di 24 mesi",
+       subtitle = "Accuratezza assoluta nel tempo: i picchi segnalano le fasi difficili per tutti",
+       x = NULL, y = "RMSE mobile", colour = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+### Interpretazione
+
+Il grafico precedente mostra il vantaggio *relativo*; questo mostra la
+difficoltà *assoluta*, e il contrasto fra i due è istruttivo.
+
+Fino al 2020 tutte e cinque le linee si sovrappongono attorno a un RMSE di
+0.25-0.40, con il naive (grigio) spesso **sotto** le altre: nel periodo calmo i
+modelli econometrici non solo non aiutano, ma a tratti sono marginalmente
+peggiori.
+
+Dal 2020 l'errore di tutti esplode, fino a superare 1.0 punto percentuale nel
+2023. Ed è esattamente lì che le linee **si separano**: il naive sale molto più
+degli altri, toccando 1.35, mentre gli ECM restano attorno a 1.0. Il divario
+massimo fra il naive e il miglior modello coincide con il momento di massima
+difficoltà per tutti.
+
+Dopo il 2025 le linee ridiscendono e tornano a sovrapporsi.
+
+**La lettura congiunta dei due grafici** è la sintesi del progetto: quando
+prevedere è facile, tutti i modelli si equivalgono e la complessità non paga;
+quando prevedere è difficile, l'informazione strutturale aggiuntiva — Europa,
+petrolio, meccanismo di correzione — produce un vantaggio misurabile. Il valore
+di un modello econometrico si manifesta proprio quando serve di più.
+
+# Accuratezza per regime macroeconomico
+
+```{r metriche_per_regime}
+# Chunk: metriche_per_regime
+# Il periodo coperto attraversa fasi molto diverse. Invece di dividere per anno
+# (arbitrario), si divide per REGIME macroeconomico, cosi' da verificare
+# l'ipotesi emersa nel notebook 06: l'ECM rende meglio quando l'inflazione si
+# muove, peggio quando e' stabile.
+cv_regimi <- cv %>%
+  mutate(
+    anno = lubridate::year(as.Date(date)),
+    regime = case_when(
+      date <= yearmonth("2013-12")                             ~ "2010-2013 crisi debito",
+      date <= yearmonth("2019-12")                             ~ "2014-2019 bassa inflazione",
+      date <= yearmonth("2021-12")                             ~ "2020-2021 pandemia",
+      date <= yearmonth("2022-12")                             ~ "2022 shock energetico",
+      TRUE                                                      ~ "2023-2026 disinflazione"
+    )
+  )
+
+cv_regimi %>%
+  group_by(regime, modello) %>%
+  summarise(n = n(), RMSE = round(sqrt(mean(errore^2)), 4), .groups = "drop") %>%
+  pivot_wider(names_from = modello, values_from = RMSE) %>%
+  arrange(regime)
+```
+
+```{r vincitori_per_regime}
+# Chunk: vincitori_per_regime
+# Il modello con RMSE minore in ciascun regime, con il margine sul secondo.
+cv_regimi %>%
+  group_by(regime, modello) %>%
+  summarise(RMSE = sqrt(mean(errore^2)), n = n(), .groups = "drop") %>%
+  group_by(regime) %>%
+  arrange(RMSE, .by_group = TRUE) %>%
+  summarise(
+    n           = first(n),
+    vincitore   = first(modello),
+    RMSE_1      = round(first(RMSE), 4),
+    secondo     = nth(modello, 2),
+    RMSE_2      = round(nth(RMSE, 2), 4),
+    margine_pct = round(100 * (nth(RMSE, 2) - first(RMSE)) / nth(RMSE, 2), 1),
+    .groups = "drop"
+  )
+```
+
+**Questa tabella è il test dell'ipotesi del notebook 06.** Se l'ECM rende
+davvero meglio nelle fasi di aggiustamento, dovrebbe vincere — o almeno
+avvicinarsi molto — nei regimi 2020-2021, 2022 e 2023-2026, e perdere nel
+periodo 2014-2019 di inflazione piatta.
+
+La colonna `margine_pct` dice quanto è netta ciascuna vittoria: un margine
+dell'1-2% su poche decine di osservazioni non è sostanzialmente diverso da un
+pareggio, mentre un margine del 20-30% è un risultato vero.
+
+```{r bias_per_regime}
+# Chunk: bias_per_regime
+# Controllo aggiuntivo: la distorsione (ME) regime per regime. Serve a
+# verificare l'ipotesi emersa dal confronto con il notebook 06, secondo cui la
+# ristima mensile elimina il bias verso l'equilibrio storico che affliggeva il
+# modello a coefficienti congelati nel periodo 2023-2026.
+cv_regimi %>%
+  group_by(regime, modello) %>%
+  summarise(ME = round(mean(errore), 4), .groups = "drop") %>%
+  pivot_wider(names_from = modello, values_from = ME) %>%
+  arrange(regime)
+```
+
+### Interpretazione della distorsione per regime
+
+| Regime | ECM_A5 | ECM_A8 | arima_pars | arima_auto | Naive |
+|---|---|---|---|---|---|
+| 2010-2013 crisi debito | +0.015 | +0.010 | −0.009 | −0.010 | −0.010 |
+| 2014-2019 bassa inflazione | −0.048 | −0.045 | −0.009 | +0.001 | −0.001 |
+| 2020-2021 pandemia | **+0.046** | +0.061 | +0.140 | +0.131 | +0.154 |
+| 2022 shock energetico | +0.473 | +0.517 | +0.692 | **+0.367** | +0.667 |
+| 2023-2026 disinflazione | −0.299 | −0.302 | −0.202 | **−0.201** | −0.205 |
+
+**Il segno rivela la direzione dell'errore**: ME positivo significa che il
+modello ha **sottostimato** l'inflazione, negativo che l'ha **sovrastimata**.
+
+**Nelle fasi calme tutti i modelli sono sostanzialmente non distorti**
+(2010-2013 e 2014-2019, con ME sempre sotto 0.05 in valore assoluto). Gli ECM
+mostrano una lievissima tendenza a sovrastimare nel 2014-2019 (−0.048), ma si
+tratta di meno di mezzo decimo di punto percentuale.
+
+**Durante gli shock tutti sottostimano, ma gli ECM molto meno.** È il risultato
+più significativo della tabella. Nella pandemia gli ECM hanno un ME di +0.046 e
++0.061 contro +0.154 del naive e +0.131/+0.140 degli ARIMA: una distorsione
+**tre volte inferiore**. Nel 2022 il quadro è simile — ECM_A5 a +0.473 contro
++0.667 del naive e +0.692 dell'ARIMA parsimonioso — con la sola eccezione
+dell'`arima_auto`, che qui ha il ME più basso in assoluto (+0.367).
+
+Questo spiega, sul piano del meccanismo, il vantaggio di RMSE osservato negli
+stessi regimi: quando l'inflazione sale, gli ECM la seguono più rapidamente
+perché l'informazione su area euro e petrolio anticipa il movimento.
+
+**Nella disinflazione 2023-2026 la situazione si rovescia.** Tutti i modelli
+sovrastimano — l'inflazione è scesa più in fretta di quanto qualunque modello
+backward-looking potesse prevedere — ma gli ECM lo fanno **di più**: −0.299 e
+−0.302 contro circa −0.20 degli altri tre.
+
+### La spiegazione unitaria: un'ancora che tira sempre verso l'alto
+
+I tre risultati precedenti hanno una sola causa comune, ed è il meccanismo
+stesso di correzione d'errore.
+
+L'equilibrio di lungo periodo stimato implica per l'Italia un'inflazione
+attorno al 2-2.5% nelle condizioni di area euro e petrolio prevalenti nel
+periodo. Per gran parte del campione recente l'inflazione italiana osservata è
+stata **sotto** quel livello, quindi l'ECT è rimasto negativo e il meccanismo di
+correzione ha prodotto una **spinta persistente al rialzo**.
+
+Quella spinta è stata:
+
+- **corretta nel 2020-2021 e nel 2022**, quando l'inflazione stava
+  effettivamente risalendo da livelli depressi. L'ECM ha anticipato il movimento
+  meglio degli altri, e ne ha tratto sia un ME più contenuto sia un RMSE
+  migliore;
+- **sbagliata nel 2023-2026**, quando l'inflazione è scesa e si è stabilizzata
+  attorno all'1% invece di tornare all'equilibrio storico. La stessa spinta che
+  prima aiutava è diventata un handicap.
+
+**La conclusione è più sfumata di "l'ECM è migliore nelle turbolenze"**: l'ECM è
+migliore quando il movimento dell'inflazione va **nella direzione
+dell'equilibrio storico**, e peggiore quando se ne allontana stabilmente. Nel
+periodo studiato la prima situazione si è verificata due volte e la seconda una.
+
+### Quanto serve ristimare il modello
+
+Il confronto con il notebook 06 sullo **stesso identico periodo** (2023-2026, 44
+osservazioni) isola l'effetto della ristima mensile:
+
+| | Coefficienti congelati (nb 06) | Ristima mensile (nb 07) |
+|---|---|---|
+| ME di ECM_A5 | −0.412 | **−0.299** |
+| ME medio degli altri modelli | −0.165 | −0.203 |
+| **Eccesso di distorsione dell'ECM** | **−0.247** | **−0.096** |
+
+La ristima mensile **non elimina la distorsione, ma ne dimezza abbondantemente
+l'eccesso** rispetto agli altri modelli: da 0.25 punti a 0.10. Aggiornare il
+vettore di cointegrazione permette al modello di recepire progressivamente lo
+spostamento della relazione di lungo periodo, ma con ritardo — venticinque anni
+di storia pre-shock continuano a pesare sulla stima.
+
+La parte residua della distorsione (circa −0.20, comune a tutti i modelli) non
+riguarda l'ECM: riflette semplicemente il fatto che la disinflazione del
+2023-2024 ha sorpreso al ribasso qualunque modello basato sul passato.
+
+**L'indicazione operativa** resta valida ma va formulata con precisione: un ECM
+usato per previsione **va ristimato regolarmente**, perché il costo di non farlo
+è quantificabile e rilevante — nel nostro caso oltre un decimo di punto
+percentuale di distorsione aggiuntiva al mese. Ma la ristima non è sufficiente a
+neutralizzare un cambiamento di regime: per quello servirebbe un modello che
+ammetta esplicitamente un break nella relazione di lungo periodo.
+
+## Interpretazione per regime
+
+| Regime | n | ECM_A5 | ECM_A8 | arima_pars | arima_auto | Naive | Vincitore |
+|---|---|---|---|---|---|---|---|
+| 2010-2013 crisi debito | 48 | 0.3448 | 0.3508 | 0.3535 | 0.3584 | **0.3406** | Naive (+1.2%) |
+| 2014-2019 bassa inflazione | 72 | 0.2482 | **0.2460** | 0.2480 | 0.2478 | 0.2786 | ECM_A8 (+0.8%) |
+| 2020-2021 pandemia | 24 | 0.4474 | **0.4425** | 0.5308 | 0.5006 | 0.5719 | ECM_A8 (+1.1%) |
+| 2022 shock energetico | 12 | **1.0104** | 1.0372 | 1.2031 | 1.0804 | 1.1343 | ECM_A5 (+2.6%) |
+| 2023-2026 disinflazione | 44 | 0.6742 | 0.6777 | **0.6269** | 0.7192 | 0.8174 | arima_pars (+7.0%) |
+
+**La colonna `margine_pct` va letta con attenzione, perché confronta il primo
+con il secondo classificato e quindi sottostima i divari veri.** Nei regimi
+2014-2019, 2020-2021 e 2022 il primo e il secondo posto sono occupati dai due
+ECM, che sono quasi identici fra loro: il margine dell'1% non misura il
+vantaggio dell'approccio ECM, misura la differenza fra due sue varianti. Il
+confronto informativo è quello con gli **altri** approcci.
+
+Rifacendo il conto in quei termini, il quadro cambia sostanzialmente:
+
+| Regime | Miglior ECM contro il naive | Miglior ECM contro il miglior ARIMA |
+|---|---|---|
+| 2010-2013 | +1.2% peggio | 2.5% meglio |
+| 2014-2019 | **11.7% meglio** | 0.7% meglio |
+| 2020-2021 | **22.6% meglio** | **11.6% meglio** |
+| 2022 | **10.9% meglio** | **6.5% meglio** |
+| 2023-2026 | 17.5% meglio | 7.5% peggio |
+
+**Il regime 2020-2021 è il risultato più forte del progetto.** Durante la
+pandemia il miglior ECM ha un RMSE di 0.4425 contro 0.5719 del random walk
+(**22.6% di errore in meno**) e 0.5006 del miglior ARIMA (**11.6% in meno**).
+Non è un margine marginale: è la dimostrazione che nell'evento più imprevedibile
+del campione l'informazione su area euro e petrolio ha avuto un valore
+previsivo reale e sostanziale.
+
+**Il 2022 conferma**, con margini più contenuti ma nella stessa direzione: ECM
+migliore sia del naive (+10.9%) sia degli ARIMA (+6.5%), su un regime in cui
+l'errore assoluto di tutti supera il punto percentuale.
+
+**Il 2014-2019 va letto con cautela.** L'ECM_A8 risulta formalmente vincitore,
+ma con 0.2460 contro 0.2478 dell'ARIMA e 0.2480 dell'altro ARIMA: una
+differenza nella terza cifra decimale, cioè un pareggio. L'unico scarto reale è
+verso il naive (+11.7%), quindi in quel periodo i modelli stimati battono la
+previsione ingenua ma sono indistinguibili fra loro.
+
+**Il 2010-2013 è l'unico regime in cui il naive vince**, e lo fa di appena
+l'1.2% sull'ECM_A5: anche questo un sostanziale pareggio.
+
+**Il 2023-2026 è l'unico regime in cui gli ECM perdono contro un ARIMA**, e di
+un margine non trascurabile (7.5%). È esattamente il periodo del notebook 06, e
+spiega perché quel notebook fosse arrivato a una conclusione opposta. La causa
+è plausibilmente lo spostamento della relazione di lungo periodo dopo il 2022:
+l'ancora dell'ECM, pur aggiornata mensilmente, resta influenzata da
+venticinque anni di storia pre-shock.
+
+### La sintesi
+
+L'ipotesi formulata nel notebook 06 esce **sostanzialmente confermata, con una
+precisazione**. La formulazione corretta non è "l'ECM vince quando l'inflazione
+si muove", ma:
+
+> L'ECM offre un vantaggio previsivo sostanziale **durante gli shock**
+> (pandemia, crisi energetica), quando l'informazione esterna su area euro e
+> petrolio anticipa movimenti che la sola storia dell'inflazione italiana non
+> può contenere. Nelle fasi di quiete è equivalente agli altri modelli stimati.
+> Nella fase di **normalizzazione successiva a uno shock** perde, perché la sua
+> relazione di lungo periodo resta ancorata al regime precedente.
+
+È una conclusione articolata, ma ogni sua parte è sostenuta da un regime
+specifico con decine di osservazioni.
+
+```{r salvataggio}
+# Chunk: salvataggio
+saveRDS(cv,              here("Data", "Processed", "cv_errori.rds"))
+saveRDS(metriche_cv,     here("Data", "Processed", "cv_metriche.rds"))
+saveRDS(risultati_dm_cv, here("Data", "Processed", "cv_diebold_mariano.rds"))
+
+write_csv(metriche_cv,     here("Output", "cv_metriche.csv"))
+write_csv(risultati_dm_cv, here("Output", "cv_diebold_mariano.csv"))
+```
+
+# Risposte alle domande poste all'inizio
+
+**1. L'ARIMA parsimonioso è davvero il migliore?**
+No, non su un orizzonte lungo. Su 200 previsioni è terzo per RMSE, dietro
+entrambi gli ECM. Resta primo per MAE, ma con margini minimi. Il suo primato nel
+notebook 06 era **specifico del periodo 2023-2026**, dove effettivamente vince
+del 7%.
+
+**2. L'ECM è peggiore, o semplicemente diverso?**
+Diverso, e su RMSE migliore. Il confronto sul MAE che nel notebook 06 era a
+p = 0.0501 sfavorevole all'ECM qui scende a p = 0.728: quella differenza era un
+fenomeno di periodo, non una proprietà dei modelli.
+
+**3. Qualcuno batte davvero il random walk?**
+Sì in termini di RMSE — il miglior ECM del 14% — ma **non in modo
+statisticamente significativo** (p = 0.112). Il risultato si colloca esattamente
+nella zona grigia documentata dalla letteratura: miglioramenti reali ma modesti
+e difficili da certificare. Sul MAE il vantaggio si riduce al 4-6%.
+
+**4. Esiste la performance condizionale al regime?**
+Sì, e con evidenza solida. Gli ECM superano nettamente gli altri modelli durante
+pandemia (+22.6% sul naive) e shock energetico (+10.9%), sono equivalenti nelle
+fasi calme e perdono nella normalizzazione post-shock.
+
+# Conclusioni
+
+**Il risultato principale.** Su 200 previsioni fuori campione a un passo, il
+modello a correzione d'errore `ECM_A5` ottiene l'RMSE più basso, riducendo
+l'errore del 14% rispetto al random walk e del 4.6% rispetto al miglior
+benchmark univariato. Il vantaggio non raggiunge la significatività statistica
+convenzionale.
+
+**Il risultato più interessante.** Quel vantaggio non è distribuito nel tempo ma
+**concentrato negli anni 2020-2023**. Nel decennio precedente i modelli
+econometrici non si distinguono dal random walk. Il valore dell'informazione
+strutturale emerge quando la serie si muove in modo imprevedibile, ed è
+irrilevante quando non si muove.
+
+**La ragione per cui la significatività non si raggiunge** è questa stessa
+concentrazione: un vantaggio reale ma confinato a pochi mesi produce un
+differenziale di perdita ad alta varianza, e il test di Diebold-Mariano richiede
+campioni molto più lunghi per certificarlo.
+
+**Il meccanismo dietro il risultato.** La scomposizione della distorsione per
+regime mostra che il vantaggio dell'ECM non deriva genericamente dalla
+"turbolenza", ma dalla **direzione** del movimento: l'ancora di lungo periodo
+esercita una spinta persistente verso l'equilibrio storico, che è stata
+corretta quando l'inflazione risaliva (2020-2022) e sbagliata quando si è
+stabilizzata sotto quell'equilibrio (2023-2026).
+
+**Un'indicazione operativa quantificata.** Il confronto con il notebook 06 sullo
+stesso periodo mostra che la ristima mensile **dimezza l'eccesso di distorsione**
+dell'ECM rispetto agli altri modelli (da 0.25 a 0.10 punti percentuali) senza
+eliminarlo. Un ECM usato in produzione va aggiornato con regolarità, ma
+l'aggiornamento non basta a neutralizzare un cambiamento di regime: per quello
+servirebbe una specificazione che ammetta esplicitamente un break nella
+relazione di lungo periodo.
+
+**Un risultato metodologico.** La classifica dei modelli è cambiata fra il
+notebook 06 e il notebook 07 non perché uno dei due sia sbagliato, ma perché
+valutano periodi diversi. Un singolo taglio train/test — per quanto
+correttamente impostato — può restituire un'immagine non rappresentativa, e la
+validazione incrociata non è un raffinamento opzionale ma la differenza fra una
+conclusione locale e una generale.
+
+# Limiti di questo disegno
+
+1. **Gli ordini ARIMA e le specificazioni ECM sono fissati a priori**, sulla
+   base di analisi condotte su dati fino al 2022 che si sovrappongono al periodo
+   di valutazione. È una lieve forma di look-ahead, mitigata dal fatto che la
+   stessa concessione vale per tutti i modelli confrontati.
+
+2. **Previsioni a un passo soltanto.** Un previsore reale è spesso interessato a
+   orizzonti di 3, 6 o 12 mesi, dove il ranking potrebbe essere diverso — e dove
+   l'ECM potrebbe comportarsi relativamente meglio, dato che il suo vantaggio
+   teorico riguarda la dinamica di riaggiustamento, non il mese successivo.
+
+3. **L'origine iniziale è una scelta discrezionale.** Anticiparla darebbe più
+   osservazioni ma finestre di stima iniziali meno affidabili; posticiparla il
+   contrario. Un controllo di robustezza utile sarebbe ripetere l'esercizio con
+   un'origine diversa.
+
+4. **Previsione pseudo-real-time, non real-time.** È il limite più importante da
+   dichiarare, e riguarda due aspetti distinti.
+
+   Il primo è il **ritardo di pubblicazione**. L'esercizio assume che al momento
+   di prevedere il mese *t* siano noti tutti i valori del mese *t−1*. In realtà
+   l'HICP di un mese viene pubblicato con due o tre settimane di ritardo: un
+   previsore che operasse all'inizio del mese *t* non disporrebbe ancora del
+   dato definitivo di *t−1*. Questo vincolo però **grava allo stesso modo su
+   tutti i modelli confrontati** — anche l'ARIMA e il naive usano il valore di
+   *t−1* — quindi non distorce il confronto fra di essi, ma rende i livelli
+   assoluti di accuratezza un po' ottimistici per tutti.
+
+   Il secondo è l'uso di **dati nella versione definitiva anziché nel vintage
+   disponibile all'epoca**. Per l'HICP l'impatto è trascurabile, perché l'indice
+   non viene praticamente rivisto dopo la pubblicazione — a differenza, per
+   esempio, della produzione industriale, che è soggetta a revisioni sostanziali
+   e che per questa ragione non entra in nessuno dei modelli valutati.
+
+   Un esercizio pienamente real-time richiederebbe una banca dati di vintage
+   storici (per l'area euro esiste il Real Time Database della BCE) ed esula
+   dallo scopo di questo lavoro.
+
+5. **Il vantaggio dipende da pochi episodi.** Le conclusioni sulla performance
+   durante gli shock si fondano su 24 osservazioni per la pandemia e 12 per il
+   2022. Sono numerosità sufficienti a essere indicative, non a essere
+   conclusive.

@@ -1,0 +1,41 @@
+# ==========================================================================
+# .gitignore per il progetto Inflazione Italia
+# Va posizionato nella cartella RADICE, accanto a README.md e al file .Rproj
+# ==========================================================================
+ 
+# --- File di sessione R e RStudio -----------------------------------------
+# .RData e .Rhistory contengono lo stato della sessione: non servono a nessuno
+# che cloni il progetto, cambiano a ogni esecuzione e sporcano la cronologia.
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+.Renviron
+ 
+# --- Dati generati dai notebook -------------------------------------------
+# Tutto il contenuto di Data/Processed viene ricreato eseguendo i notebook in
+# ordine, quindi non va versionato. Si tiene pero' la cartella (.gitkeep),
+# altrimenti git non la ricrea al clone e i saveRDS falliscono.
+Data/Processed/*
+!Data/Processed/.gitkeep
+ 
+# Stessa logica per gli output esportati in CSV.
+Output/*
+!Output/.gitkeep
+ 
+# --- Cache di knitr -------------------------------------------------------
+*_cache/
+cache/
+ 
+# --- File ausiliari prodotti da LaTeX (solo se knitti in PDF) -------------
+*.log
+*.aux
+*.out
+*.toc
+*.synctex.gz
+ 
+# --- File di sistema ------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+ 

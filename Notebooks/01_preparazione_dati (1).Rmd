@@ -1,0 +1,299 @@
+---
+title: "01 - Preparazione dei Dati"
+subtitle: "Inflazione Italia - Analisi Econometrica"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Chunk: setup
+# Opzioni globali del notebook
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Librerie necessarie SOLO per questo notebook (caricamento, pulizia, unione dati)
+library(tidyverse)   # dplyr, readr, tidyr: importazione, pulizia e manipolazione dati
+library(tsibble)     # yearmonth, as_tsibble: trasformazione in serie temporale tidy
+library(here)        # here(): percorsi file ancorati alla cartella del progetto (.Rproj),
+                      # cosi' funzionano sempre, indipendentemente da dove/come apri il notebook
+```
+
+```{r caricamento_dati_raw}
+# Chunk: caricamento_dati_raw
+# Carichiamo i dataset raw. here("Data", "Raw", "...") costruisce il percorso
+# a partire dalla cartella del progetto (dove si trova Inflazione-Italia.Rproj),
+# quindi funziona sempre, anche se sposti il notebook o lo apri diversamente.
+
+# --- Funzione di lettura per i file BCE -------------------------------------
+# Il formato dell'export BCE e' cambiato con la migrazione dal dataset ICP al
+# dataset HICP: il vecchio file aveva 3 colonne (data, periodo, valore), il
+# nuovo ne ha 2. Invece di codificare un numero fisso di colonne - che si rompe
+# a ogni cambio di formato - questa funzione le riconosce:
+#   - PRIMA colonna  = periodo temporale
+#   - ULTIMA colonna = valore osservato
+# e capisce da sola se le date sono scritte come "1997-01-31" oppure "1997Jan".
+# Funziona quindi sia col formato vecchio sia col nuovo.
+leggi_hicp_bce <- function(percorso, nome_valore) {
+
+  grezzo <- read_csv(percorso, col_types = cols(.default = col_character()))
+
+  cat("File:", basename(percorso), "\n")
+  cat("  Colonne trovate:", paste(names(grezzo), collapse = "  |  "), "\n")
+
+  periodo_raw <- grezzo[[1]]
+  valore      <- suppressWarnings(as.numeric(grezzo[[ncol(grezzo)]]))
+
+  # Riconoscimento automatico del formato della data
+  if (any(grepl("^\\d{4}-\\d{2}", periodo_raw), na.rm = TRUE)) {
+    # formato "1997-01-31" o "1997-01"
+    date_col <- yearmonth(as.Date(paste0(substr(periodo_raw, 1, 7), "-01")))
+    cat("  Formato data riconosciuto: AAAA-MM-GG\n")
+  } else {
+    # formato "1997Jan"
+    date_col <- yearmonth(periodo_raw)
+    cat("  Formato data riconosciuto: AAAAMmm (es. 1997Jan)\n")
+  }
+
+  out <- tibble(date = date_col, valore = valore) %>%
+    dplyr::filter(!is.na(date), !is.na(valore)) %>%
+    rename(!!nome_valore := valore) %>%
+    arrange(date) %>%
+    as_tsibble(index = date)
+
+  cat("  ->", nrow(out), "osservazioni |",
+      as.character(min(out$date)), "->", as.character(max(out$date)), "\n\n")
+
+  out
+}
+
+# 1. Inflazione Italia (HICP)
+# FONTE: BCE Data Portal, serie HICP.M.IT.N.000000.4D0.ANR
+# (sostituisce la serie ICP.M.IT.N.000000.4.ANR del vecchio dataset ICP,
+#  non piu' aggiornata dopo la migrazione al dataset HICP)
+hicp_it <- leggi_hicp_bce(
+  here("Data", "Raw", "Inflazione_ita_jan1997_aug2026.csv"), "hicp_it"
+)
+
+# 2. Inflazione Area Euro (HICP)
+# FONTE: BCE Data Portal, serie HICP.M.U2.N.000000.4D0.ANR
+# Scaricata dallo STESSO dataset della serie italiana: le due variabili
+# entrano insieme nella relazione di cointegrazione, quindi devono provenire
+# dalla stessa metodologia e dallo stesso vintage.
+hicp_eu <- leggi_hicp_bce(
+  here("Data", "Raw", "Inflazione_eu_jan1997_aug2026.csv"), "hicp_ea"
+)
+
+# 3. Produzione Industriale Italia
+ind_prod_raw <- read_csv(here("Data", "Raw", "industrial_production_italy.csv.csv"),
+                         col_types = cols(
+                           observation_date = col_character(),
+                           ITAPROINDMISMEI = col_double()
+                         ))
+
+# 4. Petrolio Brent (quotato in USD/barile)
+brent_raw <- read_csv(here("Data", "Raw", "brent_crude_oil.csv.csv"),
+                      col_types = cols(
+                        observation_date = col_character(),
+                        MCOILBRENTEU = col_double()
+                      ))
+
+# 5. Tasso di cambio USD/EUR, in due parti (vedi spiegazione sotto).
+# NOTA sui nomi file: i due CSV vanno tenuti distinti e riconoscibili. Qui si
+# usano i nomi delle serie FRED ("EXUSEC.csv" per il pezzo ECU 1978-1998 e
+# "EXUSEU.csv" per il pezzo EUR dal 1999): se li rinomini, aggiorna anche le
+# due righe qui sotto.
+exusec_raw <- read_csv(here("Data", "Raw", "EXUSEC.csv"),
+                       col_types = cols(
+                         observation_date = col_character(),
+                         EXUSEC = col_double()
+                       ))
+
+exuseu_raw <- read_csv(here("Data", "Raw", "EXUSEU.csv"),
+                       col_types = cols(
+                         observation_date = col_character(),
+                         EXUSEU = col_double()
+                       ))
+
+# Controllo rapido: prime righe dell'inflazione italiana gia' pulita
+head(hicp_it)
+```
+
+### Perché convertire il Brent in euro, e perché servono due file di cambio
+
+Il Brent è quotato in **USD/barile**. Le altre variabili dell'analisi (inflazione italiana ed europea) vivono nell'economia euro: usare il prezzo in dollari senza convertirlo mescola due segnali distinti — il vero prezzo del petrolio *e* le fluttuazioni del cambio USD/EUR, che non hanno un legame diretto con l'inflazione europea. Convertendo il Brent in euro si isola il segnale energetico "puro" effettivamente rilevante per l'Eurozona.
+
+Il problema: il campione parte da **gennaio 1997**, ma l'euro come valuta esiste solo da **gennaio 1999**. Per i due anni precedenti non esiste un cambio USD/EUR nel senso letterale.
+
+**Strategia adottata**: uso il predecessore legale diretto dell'euro, l'**ECU** (European Currency Unit). Al momento dell'introduzione dell'euro il tasso di conversione è stato fissato **1 ECU = 1 EUR esattamente** — non una stima o un'approssimazione, ma un fatto normativo. La prova della continuità: la Federal Reserve americana pubblicava la serie *"Dollari USA per 1 ECU"* (FRED, codice `EXUSEC`) fino a **dicembre 1998**, per poi sostituirla esattamente da **gennaio 1999** con *"Dollari USA per 1 Euro"* (FRED, codice `EXUSEU`) — la stessa fonte ha trattato le due serie come un'unica serie continua, semplicemente rinominata alla nascita della nuova valuta. Le due serie si incollano quindi senza alcun buco e senza sovrapposizione: `EXUSEC` copre fino a dicembre 1998, `EXUSEU` parte da gennaio 1999.
+
+```{r pulizia_dati}
+# Chunk: pulizia_dati
+# Convertiamo ogni serie in formato tsibble con una colonna "date" in
+# formato yearmonth (es. "1997Jan" -> 1997-01) e rinominiamo la variabile
+# di valore con un nome breve e coerente tra le serie.
+
+# NOTA: hicp_it e hicp_ea sono gia' in forma pulita (tsibble con colonne
+# date + valore), perche' la funzione leggi_hicp_bce() del chunk precedente
+# fa lettura e pulizia in un unico passaggio. Qui restano da sistemare le tre
+# serie FRED, che hanno tutte lo stesso formato semplice.
+
+# 3. Produzione industriale
+ind_prod <- ind_prod_raw %>%
+  mutate(date = yearmonth(observation_date),
+         ind_pro = ITAPROINDMISMEI) %>%
+  dplyr::select(date, ind_pro) %>%
+  as_tsibble(index = date)
+
+# 4. Brent (ancora in USD/barile a questo stadio; la conversione avviene
+#    nel chunk unione_dataset, dopo aver unito anche il tasso di cambio)
+brent <- brent_raw %>%
+  mutate(date = yearmonth(observation_date),
+         brent = MCOILBRENTEU) %>%
+  dplyr::select(date, brent) %>%
+  as_tsibble(index = date)
+
+# 5. Tasso di cambio USD/EUR: incollo ECU (fino al 1998) ed EUR (dal 1999)
+#    in un'unica serie continua "usd_per_eur" (dollari USA per 1 unita' di
+#    valuta - le due serie condividono la stessa unita' di misura, quindi
+#    la giunzione e' diretta, senza bisogno di riscalare nulla).
+cambio_ecu <- exusec_raw %>%
+  mutate(date = yearmonth(observation_date),
+         usd_per_eur = EXUSEC) %>%
+  dplyr::select(date, usd_per_eur)
+
+cambio_eur <- exuseu_raw %>%
+  mutate(date = yearmonth(observation_date),
+         usd_per_eur = EXUSEU) %>%
+  dplyr::select(date, usd_per_eur)
+
+cambio <- bind_rows(cambio_ecu, cambio_eur) %>%
+  as_tsibble(index = date)
+
+# Controllo di sicurezza: nessuna data duplicata tra il pezzo ECU e il pezzo
+# EUR (ci aspettiamo un confine netto dic-1998 / gen-1999, senza sovrapposizioni).
+# Se questo fallisce, il problema più probabile è aver scaricato un range di
+# date sbagliato da FRED per una delle due serie.
+stopifnot(!anyDuplicated(cambio$date))
+```
+
+```{r controllo_pulizia}
+# Chunk: controllo_pulizia
+# Verifica visiva che la conversione delle date sia andata a buon fine sulle
+# serie FRED (le due serie BCE sono gia' state verificate dalla funzione di
+# lettura, che stampa il proprio riepilogo).
+head(ind_prod)
+head(brent)
+
+# Verifica specifica sulla giunzione ECU -> EUR: nessun buco e nessun salto
+# innaturale attorno al confine dicembre 1998 / gennaio 1999
+cambio %>%
+  dplyr::filter(date >= yearmonth("1998-08"), date <= yearmonth("1999-04"))
+```
+
+La colonna `usd_per_eur` intorno al confine deve mostrare valori che si muovono in modo continuo (nessun salto improvviso), a conferma che l'innesto ECU -> EUR è corretto e non introduce un artefatto nei dati.
+
+```{r unione_dataset}
+# Chunk: unione_dataset
+# Uniamo le serie con left_join, usando il calendario di hicp_it come
+# riferimento principale (e' la variabile target dell'analisi), poi
+# convertiamo brent da USD/barile a EUR/barile usando il cambio appena
+# costruito: EUR/barile = (USD/barile) / (USD per 1 EUR).
+df <- hicp_it %>%
+  left_join(hicp_eu, by = "date") %>%
+  left_join(ind_prod, by = "date") %>%
+  left_join(brent, by = "date") %>%
+  left_join(cambio, by = "date") %>%
+  mutate(brent = brent / usd_per_eur) %>%   # da USD/barile a EUR/barile
+  dplyr::select(-usd_per_eur)
+```
+
+Da qui in avanti, in **tutti i notebook successivi**, la colonna `brent` è denominata in **euro/barile**, non più in dollari. Il nome della colonna resta lo stesso apposta: tutta la pipeline successiva (test di stazionarietà, differenza logaritmica, cointegrazione, ECM) resta identica nella struttura — cambia solo il numero che c'è dentro `brent`, non il codice che lo usa.
+
+```{r controllo_missing}
+# Chunk: controllo_missing
+# Riepilogo: range temporale, numero di righe e missing per colonna
+df %>%
+  as_tibble() %>%
+  summarise(
+    inizio = min(date),
+    fine = max(date),
+    n_righe = n(),
+    n_missing_hicp_it = sum(is.na(hicp_it)),
+    n_missing_hicp_ea = sum(is.na(hicp_ea)),
+    n_missing_indpro = sum(is.na(ind_pro)),
+    n_missing_brent = sum(is.na(brent))
+  )
+
+# DIAGNOSTICA: fino a quando arriva ciascuna serie. Serve a sapere sempre
+# QUALE variabile sta determinando la fine del campione, invece di scoprirlo
+# per caso a valle dell'analisi.
+df %>%
+  as_tibble() %>%
+  summarise(across(c(hicp_it, hicp_ea, ind_pro, brent),
+                   ~ max(date[!is.na(.x)]))) %>%
+  pivot_longer(everything(), names_to = "serie", values_to = "ultima_data_disponibile") %>%
+  arrange(ultima_data_disponibile)
+```
+
+### Quali variabili possono decidere la fine del campione
+
+Le quattro serie hanno date di fine diverse: `ind_pro` (FRED) si ferma a **marzo
+2024**, mentre le altre tre — inflazione italiana, inflazione dell'area euro e
+Brent — arrivano tutte ad **agosto 2026**. Questa asimmetria richiede una scelta
+consapevole, perché un `drop_na()` applicato indiscriminatamente a tutte le
+colonne eliminerebbe ogni riga successiva a marzo 2024 — **buttando via quasi
+due anni e mezzo di dati su inflazione italiana, europea e petrolio, che invece
+sono disponibili**, solo perché manca la produzione industriale.
+
+Sarebbe una perdita grave e ingiustificata: il campione di valutazione fuori
+campione (2023 in poi) passerebbe da 44 a 15 osservazioni, riducendo
+drasticamente l'affidabilità del confronto finale fra modelli.
+
+**La distinzione fra variabili essenziali e variabili di supporto.**
+`hicp_it` è la variabile target, mentre `hicp_ea` e `brent` entrano nella
+relazione di cointegrazione e quindi nell'Error Correction Term: senza una di
+queste tre non si può né stimare né prevedere nulla. Sono **essenziali**, e una
+riga che ne abbia anche solo una mancante va eliminata.
+
+`ind_pro` ha invece un ruolo diverso. Serve all'analisi di stazionarietà del
+notebook 02 — ed è lì che emerge il suo break strutturale del 2008, che
+giustifica la sua esclusione dal test di cointegrazione — ma **non entra nella
+relazione di lungo periodo**, e quindi neanche nell'ECT. Resta come possibile
+regressore di breve periodo, disponibile per tutto il periodo di stima (il
+training set finisce a dicembre 2022, dove `ind_pro` è completa). Non c'è
+nessuna ragione per cui debba determinare la fine dell'intero campione.
+
+```{r gestione_missing}
+# Chunk: gestione_missing
+# Eliminiamo solo le righe che hanno valori mancanti nelle tre variabili
+# ESSENZIALI (target + le due che compongono la relazione di cointegrazione).
+# ind_pro resta nel dataset ma puo' essere NA nella coda: e' una variabile di
+# supporto per l'analisi di stazionarieta', non entra nell'ECT, e lasciarla
+# decidere la fine del campione costerebbe quasi due anni di test set.
+#
+# I missing restano comunque confinati alle estremita' del periodo (serie con
+# copertura diversa), non sono buchi interni: nessuna interpolazione necessaria.
+df <- df %>%
+  tidyr::drop_na(hicp_it, hicp_ea, brent)
+
+cat("Campione finale:", nrow(df), "righe |",
+    as.character(min(df$date)), "->", as.character(max(df$date)), "\n")
+cat("Righe con ind_pro mancante (solo in coda):", sum(is.na(df$ind_pro)), "\n")
+```
+
+**Effetto della scelta sul resto del progetto: nessuno, salvo l'allungamento
+del test set.** Il training set termina a dicembre 2022, periodo in cui
+`ind_pro` è interamente disponibile: tutte le stime, i test di stazionarietà, il
+test di Johansen e la selezione della specificazione ECM restano quindi
+identici. Cambia solo la lunghezza del periodo di valutazione fuori campione,
+che passa da 15 a **44 osservazioni**, quasi triplicando.
+
+```{r salvataggio}
+# Chunk: salvataggio
+# Salviamo il dataset unificato e pulito, sia in CSV (leggibile ovunque)
+# sia in formato RDS (mantiene i tipi di dato R, incluso tsibble/yearmonth)
+write_csv(df, here("Data", "Processed", "clean_dataset.csv"))
+saveRDS(df, here("Data", "Processed", "clean_dataset.rds"))
+
+cat("Salvato:", nrow(df), "righe |", as.character(min(df$date)), "->",
+    as.character(max(df$date)), "\n")
+cat("Colonne:", paste(names(df), collapse = ", "))
+```

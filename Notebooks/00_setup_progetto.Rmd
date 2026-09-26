@@ -1,0 +1,80 @@
+---
+title: "00 - Setup e Preparazione Progetto"
+subtitle: Inflazione Italia - Analisi Econometrica
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup_opzioni_globali, include=FALSE}
+# Chunk: setup_opzioni_globali
+# Opzioni globali del notebook: mostra il codice, silenzia warning/messaggi superflui
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Impedisce a R di compilare pacchetti da codice sorgente: forza sempre
+# l'installazione del binario precompilato. Questo rende il progetto
+# eseguibile su qualsiasi PC SENZA bisogno di installare Rtools (Windows)
+# o Xcode Command Line Tools (Mac).
+options(install.packages.compile.from.source = "never")
+```
+
+```{r installazione_pacchetti}
+# Chunk: installazione_pacchetti
+# Elenco di tutti i pacchetti usati nel progetto, con una breve nota sul motivo.
+# Vengono installati SOLO quelli mancanti: se rilanci questo chunk in futuro
+# non reinstalla nulla che hai già.
+
+pacchetti_progetto <- c(
+  "tidyverse",   # dplyr, ggplot2, readr, tidyr, lubridate, forcats: pulizia dati e grafici
+  "tsibble",     # struttura dati "tidy" per serie temporali (yearmonth, tsibble)
+  "feasts",      # analisi esplorativa: ACF/PACF, gg_tsdisplay, decomposizione
+  "fabletools",  # funzioni di supporto per i modelli fable (report, glance, accuracy)
+  "fable",       # modelli di forecasting (ARIMA, ETS) integrati con tsibble
+  "zoo",         # conversioni di date mensili (as.yearmon) e serie irregolari
+  "urca",        # test di radice unitaria e cointegrazione (ADF, KPSS, Zivot-Andrews, Johansen)
+  "tseries",     # test di stazionarietà alternativi e utility per serie temporali
+  "vars",        # modelli VAR e selezione automatica dei ritardi (VARselect)
+  "lmtest",      # test diagnostici sui modelli lineari (es. Breusch-Godfrey)
+  "FinTS",       # test ARCH-LM per l'eteroschedasticità condizionata sui residui
+  "here"         # percorsi file robusti, ancorati alla cartella del progetto (.Rproj)
+)
+
+# Controlla quali pacchetti NON sono ancora installati sul sistema
+pacchetti_mancanti <- pacchetti_progetto[
+  !sapply(pacchetti_progetto, requireNamespace, quietly = TRUE)
+]
+
+# Installa solo quelli mancanti, forzando il tipo "binary" dove disponibile
+if (length(pacchetti_mancanti) > 0) {
+  install.packages(pacchetti_mancanti, type = "binary")
+} else {
+  cat("Tutti i pacchetti sono già installati.\n")
+}
+```
+
+```{r caricamento_librerie}
+# Chunk: caricamento_librerie
+# Caricamento di tutte le librerie necessarie al progetto, con nota sul loro uso.
+
+library(tidyverse)   # dplyr, ggplot2, readr, tidyr: gestione dati e grafici
+library(lubridate)   # manipolazione di date (incluso in tidyverse, richiamato esplicitamente)
+library(tsibble)     # yearmonth, tsibble: rappresentazione tidy delle serie temporali
+library(feasts)       # ACF, PACF, gg_tsdisplay: diagnostica esplorativa delle serie
+library(fabletools)  # report(), glance(), accuracy(): supporto ai modelli fable
+library(fable)       # ARIMA() e altri modelli di forecasting su tsibble
+library(zoo)         # as.yearmon: conversioni di date mensili
+library(urca)        # ur.df, ur.kpss, ur.za, ca.jo: test di radice unitaria e cointegrazione
+library(tseries)     # test di stazionarietà e utility aggiuntive per serie storiche
+library(vars)        # VAR(), VARselect(): modelli vettoriali autoregressivi
+library(lmtest)      # bgtest(): test di autocorrelazione sui residui (Breusch-Godfrey)
+library(FinTS)       # ArchTest(): test ARCH-LM per eteroschedasticità condizionata
+library(here)        # here(): costruisce percorsi a partire dalla cartella del progetto
+```
+
+```{r controllo_versioni}
+# Chunk: controllo_versioni
+# Stampa un riepilogo di R e delle versioni dei pacchetti caricati.
+# Utile per la riproducibilità: se qualcosa smette di funzionare in futuro,
+# questo blocco aiuta a capire se è cambiata una versione di un pacchetto.
+sessionInfo()
+```

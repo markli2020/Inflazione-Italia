@@ -1,0 +1,329 @@
+---
+title: "03 - Test di Cointegrazione (Johansen)"
+subtitle: "Inflazione Italia - Analisi Econometrica"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+# Chunk: setup
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+# Librerie necessarie per questo notebook
+library(tidyverse)   # dplyr, tidyr: manipolazione dati
+library(tsibble)     # gestione serie temporali tidy
+library(here)        # percorsi file ancorati alla cartella del progetto
+library(vars)        # VARselect(): selezione dei ritardi del VAR sottostante
+library(urca)        # ca.jo(): test di cointegrazione di Johansen
+```
+
+# Obiettivo del notebook
+
+Il notebook 02 ha stabilito che `hicp_it`, `hicp_ea` e `brent` sono I(1): prese
+singolarmente non hanno un livello di riferimento fisso, e uno shock che le
+colpisce non si riassorbe. Regredire una sull'altra in livello produrrebbe
+quindi una relazione spuria.
+
+Esiste però un'eccezione, ed è il cuore di questo notebook: se esiste una
+**combinazione lineare** di quelle variabili che è stazionaria, allora le serie
+sono legate da una relazione di equilibrio di lungo periodo, e la regressione
+in livello non solo è legittima, ma è l'unico modo corretto di rappresentarla.
+È il concetto di **cointegrazione**.
+
+L'immagine più utile è quella dell'elastico: le tre variabili possono
+allontanarsi l'una dall'altra nel breve periodo, ma non indefinitamente —
+esiste una proporzione a cui tendono a tornare. Il test di Johansen stabilisce
+se quell'elastico esiste, quanti ce ne sono, e qual è la proporzione.
+
+L'esito decide la strada modellistica: senza cointegrazione si procederebbe con
+un SARIMAX sulle sole differenze; con cointegrazione il modello corretto è un
+**ECM**, e un modello che ignorasse il legame di lungo periodo sarebbe mal
+specificato.
+
+# Caricamento dati
+
+```{r caricamento_dati}
+# Chunk: caricamento_dati
+# Carichiamo il train set salvato dal notebook 02 (livello, non differenziato:
+# il test di Johansen si fa sui livelli delle variabili I(1)).
+df_train <- readRDS(here("Data", "Processed", "df_train.rds"))
+```
+
+# Costruzione del sistema
+
+### Perché il sistema include solo hicp_it, hicp_ea e log_brent
+
+La cointegrazione ha senso solo fra variabili che condividono lo stesso ordine
+di integrazione. Dal notebook 02:
+
+- `hicp_it`, `hicp_ea` e `brent` sono **I(1)** in modo genuino — lo
+  Zivot-Andrews non ha rifiutato la radice unitaria nemmeno concedendo un break
+  endogeno, quindi non si tratta di stazionarietà mascherata da un salto di
+  livello;
+- `ind_pro` è **I(0) con un break strutturale** a giugno 2008 (lo
+  Zivot-Andrews *rifiuta* la radice unitaria). Non vaga: è già stazionaria,
+  solo attorno a due livelli distinti, prima e dopo la crisi finanziaria.
+
+Includere `ind_pro` nel sistema sarebbe un errore di categoria, non una scelta
+stilistica. Una serie già stazionaria non ha bisogno di combinarsi con le altre
+per diventarlo, e questo rischia di **gonfiare artificialmente il rango
+stimato**: il test può scambiare la stazionarietà "gratuita" di `ind_pro` per
+una relazione di equilibrio autentica. In aggiunta, il break del 2008
+distorcerebbe i valori critici asintotici della trace statistic, che sono
+derivati assumendo l'assenza di rotture strutturali.
+
+Questo non esclude `ind_pro` dal progetto: nella versione differenziata
+(`dlog_ind_pro`, stazionaria) resta disponibile come regressore di breve
+periodo nell'ECM. Semplicemente non entra in un sistema che cerca relazioni di
+*lungo periodo* fra variabili non stazionarie — una relazione di quel tipo,
+nello stesso senso, non può averla.
+
+```{r costruzione_sistema}
+# Chunk: costruzione_sistema
+# Costruiamo il sistema in LIVELLO per il test di Johansen: hicp_it, hicp_ea,
+# log_brent. ind_pro e' escluso (vedi spiegazione sopra: e' I(0) con break,
+# non I(1) come le altre tre).
+sistema <- df_train %>%
+  as_tibble() %>%                       # rimuove la struttura tsibble
+  transmute(
+    hicp_it   = as.numeric(hicp_it),    # forza a numero puro
+    hicp_ea   = as.numeric(hicp_ea),
+    log_brent = as.numeric(log(brent))
+  ) %>%
+  drop_na() %>%
+  dplyr::filter(is.finite(log_brent)) %>%   # elimina eventuali -Inf da log(0)
+  as.matrix()
+
+# Controllo di sicurezza: deve dare TRUE
+is.numeric(sistema)
+```
+
+### Perché log(brent) e non brent grezzo
+
+- **Elasticità**: un aumento di 1 euro ha un impatto molto diverso se il
+  petrolio costa 20 EUR o 140 EUR. Il logaritmo linearizza la serie e rende il
+  coefficiente interpretabile come elasticità (variazione percentuale su
+  variazione percentuale), non come impatto assoluto in euro.
+- **Coerenza con `dlog_brent`**: nel notebook 02 la serie è stata
+  stazionarizzata con la differenza logaritmica. Il livello di partenza di una
+  differenza logaritmica è, per definizione, il logaritmo del livello — quindi
+  il test di cointegrazione, che lavora sui livelli, deve usare `log(brent)`.
+- **Mantenimento di I(1)**: il logaritmo è una trasformazione monotona, e una
+  serie I(1) strettamente positiva resta I(1) dopo il logaritmo. `log_brent`
+  resta quindi idonea al test.
+
+# Selezione dei ritardi
+
+```{r selezione_ritardi}
+# Chunk: selezione_ritardi
+# Scegliamo il numero di ritardi del VAR sottostante in livello.
+# Il test di Johansen e' "affamato" di gradi di liberta': con l'AIC spesso
+# si ottengono 6-7 ritardi, che creano un sistema instabile e propenso a
+# trovare cointegrazioni spurie. Il criterio SC/BIC penalizza la
+# complessita' ed e' la scelta preferita in econometria per questo test.
+lag_select <- VARselect(sistema, lag.max = 12, type = "const")
+lag_select$selection
+```
+
+### Interpretazione della selezione dei ritardi
+
+Risultato: `AIC = 3`, `HQ = 2`, `SC = 1`, `FPE = 3`. È lo schema atteso — i
+criteri si ordinano per severità della penalizzazione, con SC (il più
+conservativo) che indica il ritardo più basso e AIC/FPE (i più permissivi) che
+ne suggeriscono tre.
+
+Seguendo il criterio SC il ritardo naturale sarebbe **1**. Ma `ca.jo()` richiede
+un minimo matematico di **K = 2**: il VECM sottostante è specificato con K−1
+ritardi delle differenze, quindi con K = 1 non resterebbe alcun termine
+dinamico. Il chunk seguente forza perciò K = 2, il valore più basso compatibile
+sia con il vincolo tecnico della funzione sia con l'indicazione di parsimonia
+del criterio SC.
+
+La scelta conservativa è deliberata: un sistema sovra-parametrizzato tende a
+individuare relazioni di cointegrazione che non esistono, e con 312
+osservazioni i gradi di libertà vanno spesi con attenzione.
+
+# Test di Johansen
+
+```{r test_johansen}
+# Chunk: test_johansen
+# Test di Johansen (trace test). ca.jo() richiede K >= 2 come minimo
+# matematico: se il criterio SC sopra indica un ritardo di 1, K viene
+# comunque forzato a 2 (override manuale).
+johansen_test <- ca.jo(
+  sistema,
+  type  = "trace",
+  ecdet = "const",
+  K     = 2
+)
+
+summary(johansen_test)
+```
+
+## Interpretazione del test
+
+### Il rango di cointegrazione
+
+La procedura trace è **sequenziale** e si legge partendo dall'ipotesi più
+restrittiva, che nella stampa compare per ultima:
+
+| Ipotesi nulla | Statistica | 10% | 5% | 1% | Esito |
+|---|---|---|---|---|---|
+| r = 0 (nessuna cointegrazione) | **58.72** | 32.00 | 34.91 | 41.07 | **rifiuta** |
+| r ≤ 1 | 8.75 | 17.85 | 19.96 | 24.60 | non rifiuta |
+| r ≤ 2 | 2.79 | 7.52 | 9.24 | 12.97 | non rifiuta |
+
+Si parte da H0: *rango = 0*, cioè nessuna relazione di cointegrazione. La
+statistica vale 58.72 contro un valore critico all'1% di 41.07: l'ipotesi è
+**rifiutata con ampio margine**, quindi esiste almeno una relazione di
+equilibrio.
+
+Si passa allora a H0: *rango ≤ 1*. Qui la statistica scende a 8.75, ben al di
+sotto anche del valore critico più permissivo (17.85 al 10%): l'ipotesi **non
+viene rifiutata**. Non c'è evidenza di una seconda relazione indipendente.
+
+La procedura si ferma al primo mancato rifiuto: il rango stimato è **r = 1**.
+Esiste **una sola** relazione di equilibrio di lungo periodo fra `hicp_it`,
+`hicp_ea` e `log_brent`.
+
+Il salto fra le due statistiche (58.72 contro 8.75) è netto: non siamo in una
+situazione ambigua in cui il rango potrebbe plausibilmente essere 2. La riga
+`r ≤ 2` viene stampata per completezza dall'algoritmo ma non aggiunge
+informazione: con tre variabili il rango massimo possibile è 2, e quella riga
+andrebbe consultata solo se la precedente fosse stata rifiutata.
+
+### Un controllo di robustezza notevole
+
+Questo test è stato eseguito tre volte nel corso del progetto, su dati via via
+diversi: prima con il Brent in dollari, poi dopo la conversione in euro, infine
+con la serie HICP aggiornata del nuovo dataset BCE. Il confronto fra le tre
+esecuzioni è informativo:
+
+| | Brent in USD | Brent in EUR | EUR + HICP aggiornato |
+|---|---|---|---|
+| Rango stimato | 1 | 1 | **1** |
+| Trace statistic (r = 0) | 58.74 | 60.66 | **58.72** |
+| Coefficiente `hicp_ea` | −1.3671 | −1.3681 | **−1.3431** |
+| Coefficiente `log_brent` | +0.2216 | +0.2723 | **+0.2912** |
+| Velocità di correzione (`hicp_it`) | −0.2112 | −0.2178 | **−0.2232** |
+
+Il rango è sempre 1, e le due grandezze economicamente più importanti — il
+coefficiente di lungo periodo sull'inflazione europea e la velocità di
+correzione — si spostano di pochi centesimi nonostante un cambio di valuta e
+una revisione metodologica della serie target. È il tipo di stabilità che rende
+un risultato difendibile in sede di discussione, e vale la pena riportare
+questa tabella in tesi: mostra che le conclusioni non dipendono da una
+particolare versione dei dati.
+
+Il coefficiente su `log_brent` è il meno stabile dei tre (da 0.22 a 0.29),
+coerentemente con il fatto che sia anche il meno solido sul piano
+interpretativo, come discusso qui sotto.
+
+### La relazione di lungo periodo stimata
+
+La prima colonna della tabella `Eigenvectors` contiene la relazione associata
+al rango individuato, normalizzata ponendo a 1 il coefficiente di `hicp_it`:
+
+$$hicp\_it - 1.3431 \cdot hicp\_ea + 0.2912 \cdot \log(brent) - 0.6248 \approx 0$$
+
+Isolando l'inflazione italiana:
+
+$$hicp\_it \approx 1.3431 \cdot hicp\_ea - 0.2912 \cdot \log(brent) + 0.6248$$
+
+**Il coefficiente sull'inflazione europea (1.3431)** è il risultato principale:
+nel lungo periodo, a un punto percentuale in più di inflazione nell'area euro
+corrispondono circa **1.34 punti** in Italia. La trasmissione non è uno a uno ma
+**amplificata di circa un terzo** — l'inflazione italiana reagisce agli shock
+comuni dell'area euro in modo più marcato della media. È un risultato
+economicamente sensato e citabile, coerente con una struttura produttiva più
+esposta ai costi energetici importati e con una composizione del paniere dei
+consumi diversa da quella media europea.
+
+**Il coefficiente sul petrolio (−0.2912) va trattato con cautela**, ed è il
+punto su cui conviene essere espliciti nel report. Il segno è **negativo**: a
+parità di inflazione europea, un prezzo del petrolio più alto è associato a
+un'inflazione italiana più bassa nell'equilibrio di lungo periodo. È l'opposto
+di quanto suggerirebbe il canale di trasmissione costi-energia, che è positivo —
+e che probabilmente emergerà nella dinamica di breve periodo dell'ECM.
+
+La chiave interpretativa è che il coefficiente va letto **al netto di
+`hicp_ea`**, già presente nella relazione. L'inflazione dell'area euro
+incorpora gran parte degli shock energetici comuni: ciò che resta da spiegare a
+`log_brent` non è l'effetto del petrolio sull'inflazione, ma l'effetto
+*differenziale* rispetto a quanto già catturato dall'area euro. Un segno
+negativo può quindi riflettere un canale diverso, oppure essere un artefatto
+della normalizzazione statistica. In tesi la formulazione corretta è descrivere
+il coefficiente come parte della relazione di equilibrio stimata, dichiarando
+esplicitamente che non va letto come effetto causale diretto.
+
+### La matrice dei pesi: chi si aggiusta
+
+La prima colonna della matrice `W` (loading matrix) indica **quale variabile fa
+il lavoro di correzione** quando il sistema si allontana dall'equilibrio:
+
+| Variabile | Peso | Lettura |
+|---|---|---|
+| `hicp_it` | **−0.2232** | si aggiusta, e in modo sostanziale |
+| `hicp_ea` | −0.0739 | si aggiusta poco (circa un terzo dell'Italia) |
+| `log_brent` | +0.0159 | praticamente non reagisce |
+
+Il segno negativo su `hicp_it` è la condizione di stabilità: quando
+l'inflazione italiana si trova sopra il livello implicato dall'equilibrio, il
+mese successivo scende. Il sistema si autocorregge invece di divergere.
+
+La magnitudine si traduce in una velocità: circa il **22% dello squilibrio
+viene riassorbito ogni mese**, da cui una semivita della deviazione di
+
+$$t_{1/2} = \frac{\ln(0.5)}{\ln(1 - 0.2232)} \approx 2.7 \text{ mesi}$$
+
+Dopo uno shock che allontana l'inflazione italiana dal suo equilibrio, metà
+della deviazione si esaurisce in meno di tre mesi. È una velocità
+economicamente plausibile: né un aggiustamento istantaneo (che sarebbe sospetto
+su dati mensili di prezzi), né una correzione così lenta da rendere la
+relazione di lungo periodo irrilevante nella pratica.
+
+La gerarchia fra le tre variabili è economicamente coerente. `log_brent` ha un
+peso prossimo a zero: il prezzo del petrolio è determinato sui mercati globali
+e non reagisce agli squilibri fra inflazione italiana ed europea. `hicp_ea` si
+aggiusta circa tre volte meno dell'Italia, il che riflette il peso relativo
+delle due economie. È l'Italia ad adattarsi al contesto europeo, non il
+contrario.
+
+**Perché questo giustifica un ECM a singola equazione.** Dato che `hicp_it` è
+di gran lunga la variabile che si aggiusta di più, il prossimo notebook stima
+una sola equazione — con `hicp_it` come dipendente e il termine di correzione
+come regressore — invece di un VECM completo a tre equazioni. Un VECM sarebbe
+necessario se anche `hicp_ea` o `log_brent` si correggessero in misura
+rilevante.
+
+Va detto per completezza che la giustificazione pienamente rigorosa di questa
+semplificazione passerebbe da un **test formale di esogeneità debole** (un test
+del rapporto di verosimiglianza sui vincoli di nullità nei pesi di `hicp_ea` e
+`log_brent`). Qui la scelta poggia sul confronto fra le magnitudini, che è
+netto ma non costituisce una verifica statistica. Se volessi rafforzare il
+capitolo metodologico, quello è il test da aggiungere.
+
+# Prossimi passi
+
+Nel notebook successivo: estrazione del vettore di cointegrazione mostrato
+sopra, costruzione dell'Error Correction Term (ECT) a partire da esso, e stima
+dell'ECM.
+
+```{r salvataggio}
+# Chunk: salvataggio
+# Salviamo il sistema e l'oggetto del test di Johansen, cosi' il prossimo
+# notebook (stima dell'ECM) puo' ripartire da qui senza rieseguire il test.
+saveRDS(sistema,       here("Data", "Processed", "sistema_johansen.rds"))
+saveRDS(johansen_test, here("Data", "Processed", "johansen_test.rds"))
+```
+
+# Sintesi delle decisioni
+
+| Decisione | Motivazione |
+|---|---|
+| `ind_pro` esclusa dal sistema | È I(0) con break: includerla gonfierebbe il rango stimato e il break distorcerebbe i valori critici |
+| `log(brent)` invece di `brent` | Rende il coefficiente un'elasticità, è coerente con la log-differenza del notebook 02 e preserva l'ordine di integrazione |
+| K = 2 (criterio SC, vincolo minimo di `ca.jo`) | SC indicherebbe 1, ma il VECM richiede almeno 2; un sistema sovra-parametrizzato trova cointegrazioni spurie |
+| `ecdet = "const"` | Costante nella relazione di cointegrazione, nessun trend lineare: coerente con l'assenza di trend deterministico rilevata nel notebook 02 |
+| Trace test letto in sequenza, fermandosi al primo mancato rifiuto | È la procedura standard: proseguire oltre invaliderebbe i livelli di significatività |
+| Rango = 1 → si procede con ECM, non SARIMAX | Un modello sulle sole differenze ignorerebbe una relazione di lungo periodo dimostrata |
+| ECM a singola equazione | `hicp_it` si aggiusta circa 3 volte più di `hicp_ea` e 14 volte più di `log_brent`; un test formale di esogeneità debole rafforzerebbe la scelta |
