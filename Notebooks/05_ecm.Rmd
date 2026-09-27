@@ -1,7 +1,7 @@
 ---
 title: "05 - Modello a Correzione d'Errore (ECM) - Selezione della specificazione"
 subtitle: "Inflazione Italia - Analisi Econometrica"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -467,12 +467,22 @@ stacco si vede anche nei criteri informativi — fra il peggiore dei modelli con
 stagionalità (A7, AIC 194.79) e il migliore senza (A4, AIC 212.52) corrono quasi
 18 punti di AIC.
 
-Questo chiude il cerchio con i notebook precedenti: l'ACF/PACF del notebook 02
-mostrava uno spike isolato al ritardo 12, il benchmark ARIMA del notebook 04
-stima un `sma1 = −0.2552` significativo, e qui la selezione di specificazione
-arriva alla stessa conclusione. **Tre metodologie indipendenti** — analisi di
-autocorrelazione, modello univariato SARIMA e griglia ECM — puntano tutte sulla
-stessa componente annuale. È un argomento solido da portare in tesi.
+Questo chiude il cerchio con i notebook precedenti: l'ACF/PACF del notebook 04
+mostrava uno spike isolato e negativo al ritardo 12, i benchmark ARIMA dello
+stesso notebook stimano un coefficiente stagionale significativo (`sma1` pari a
+−0.2552 nel modello parsimonioso e −0.3458 in quello automatico), e qui la
+selezione di specificazione arriva alla stessa conclusione per una via
+completamente diversa.
+
+Vale la pena essere precisi sul grado di indipendenza fra queste evidenze. Il
+correlogramma e il modello SARIMA sono due letture della stessa serie, quindi
+non sono prove indipendenti in senso statistico: la seconda formalizza ciò che
+la prima suggerisce. La **griglia ECM è invece una verifica genuinamente
+separata**, perché arriva alla componente annuale attraverso un criterio
+diverso — quali specificazioni riescono a ripulire i residui in un modello
+multivariato con termine di correzione d'errore — e su una variabile dipendente
+in differenze anziché in livelli. Che due impianti modellistici così diversi
+convergano sulla stessa struttura è l'argomento da portare in tesi.
 
 ### La selezione: A8 vince, ma con una tensione da dichiarare
 
@@ -681,10 +691,14 @@ dati mensili di prezzi, né una correzione così lenta da rendere la relazione d
 lungo periodo irrilevante.
 
 **`d_hicp_it_l12` = −0.2939** è la componente stagionale, il secondo
-coefficiente più forte. Il segno negativo e la magnitudine sono notevolmente
-coerenti con il `sma1 = −0.2552` stimato dal benchmark ARIMA nel notebook 04,
-su una struttura di modello completamente diversa: due approcci indipendenti
-individuano la stessa struttura stagionale annuale.
+coefficiente più forte. Il confronto con i coefficienti stagionali del notebook
+04 è notevole: il modello parsimonioso stimava `sma1 = −0.2552`, quello
+automatico `sma1 = −0.3458`, e l'ECM trova **−0.2939, esattamente fra i due**.
+Tre specificazioni di natura diversa — un SARIMA a tre parametri, un SARIMA a
+sei e un modello a correzione d'errore multivariato — collocano la stessa
+componente annuale nello stesso intervallo ristretto. Non è una coincidenza
+numerica: è la firma di una struttura reale nei dati, non un artefatto di una
+particolare scelta di modello.
 
 **`d_hicp_ea_l1` = +0.2081** è la trasmissione di breve periodo dall'area euro:
 una variazione dell'inflazione europea si riflette sull'Italia con un mese di

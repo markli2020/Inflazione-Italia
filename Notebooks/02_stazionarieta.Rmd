@@ -1,7 +1,7 @@
 ---
 title: "02 - Analisi di Stazionarietà"
 subtitle: "Inflazione Italia - Analisi Econometrica"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -281,9 +281,11 @@ non un caso limite.
 
 Il verdetto automatico segnala "Inconcludente" sotto drift solo perché anche il
 KPSS non rifiuta (0.307 e 0.308 contro un critico di 0.463). Qui però il KPSS
-nella versione "mu" è un test debole: la stessa statistica, valutata sotto la
-specificazione "tau" (critico 0.146), rifiuta nettamente. Le due righe non si
-contraddicono davvero — cambia la soglia, non l'evidenza. Messe insieme alle
+nella versione "mu" è un test debole: la statistica calcolata sotto la
+specificazione "tau" (0.274 per `hicp_it` e 0.307 per `hicp_ea`, contro un
+critico di 0.146) rifiuta invece in entrambi i casi. Le due righe non si
+contraddicono davvero: cambia la soglia di riferimento, non la direzione
+dell'evidenza. Messe insieme alle
 statistiche ADF positive, la conclusione è **non stazionarietà**, e l'etichetta
 "inconcludente" della riga drift va letta come un limite di potenza del KPSS,
 non come un dubbio reale.
@@ -550,7 +552,7 @@ limite da dichiarare apertamente, non da ignorare.
 | `dlog_ind_pro` | −16.420 | 0.030 | **stazionaria** |
 
 **Tre serie su quattro sono stazionarie senza alcuna ambiguità.** Gli ADF
-rifiutano con margini enormi — da quattro a sei volte il valore critico in
+rifiutano con margini enormi — da tre a sei volte il valore critico in
 valore assoluto — e i KPSS di `dlog_brent` e `dlog_ind_pro` sono praticamente
 nulli (0.042 e 0.030 contro 0.463). La trasformazione ha funzionato.
 
@@ -564,10 +566,10 @@ compromette la stazionarietà complessiva.
 `d_hicp_ea` è stazionaria, ma con un margine stretto sul KPSS (0.413 contro
 0.463): passa senza essere un caso da manuale.
 
-**Il caso `d_hicp_it` richiede una discussione onesta.** L'ADF rifiuta con la
-seconda statistica più forte di tutte (−11.493, contro un critico di −2.87) ma
-il KPSS rifiuta anch'esso (0.646 contro 0.463), producendo il verdetto
-contraddittorio.
+**Il caso `d_hicp_it` richiede una discussione onesta.** L'ADF rifiuta con una
+statistica di −11.493 contro un critico di −2.87 — il terzo margine più ampio
+fra le quattro serie — ma il KPSS rifiuta anch'esso (0.646 contro 0.463),
+producendo il verdetto contraddittorio.
 
 L'interpretazione più plausibile è che si tratti di un artefatto del KPSS, per
 due ragioni. La prima è il comportamento noto del test: il KPSS costruisce la
@@ -575,8 +577,8 @@ propria statistica sulla varianza di lungo periodo della serie, e uno shock
 isolato di grande ampiezza — come il picco inflattivo del 2021-2022 — gonfia
 quella varianza spingendolo a rifiutare la stazionarietà anche quando la serie
 è genuinamente I(0). La seconda è la sproporzione fra le due evidenze: l'ADF non
-rifiuta di misura, rifiuta di un fattore quattro rispetto alla soglia, mentre il
-KPSS la supera di poco.
+rifiuta per un soffio, lo fa con un margine di un fattore quattro rispetto alla
+soglia, mentre il KPSS la supera di appena una volta e mezza.
 
 Ipotizzare che `d_hicp_it` sia ancora non stazionaria implicherebbe che
 `hicp_it` sia I(2), cioè che il tasso di inflazione italiano richieda due
@@ -587,8 +589,19 @@ Economicamente non è sostenibile, e il grafico della serie lo smentisce.
 La decisione è quindi di **non differenziare una seconda volta** e di
 dichiarare questo risultato fra i limiti del lavoro. È un punto che conviene
 riportare esplicitamente in tesi: mostra consapevolezza del comportamento dei
-test, invece di nascondere una diagnostica scomoda.
-si accetta d_hicp_it come genuinamente stazionaria (I(0)) nonostante il falso allarme del KPSS, confermando così che la serie dei prezzi originale hicp_it è integrata di primo ordine (I(1))
+test, invece di nascondere una diagnostica scomoda. Si accetta quindi
+`d_hicp_it` come genuinamente stazionaria — I(0) — nonostante il falso allarme
+del KPSS, il che conferma che la serie dell'inflazione italiana `hicp_it` è
+integrata di primo ordine, I(1).
+
+**Una precisazione sul significato di questo I(1).** `hicp_it` non è un indice
+dei prezzi ma è già un **tasso di variazione annuo**: dire che è I(1) equivale
+quindi a dire che il logaritmo dell'indice dei prezzi è I(2). È una conclusione
+legittima e ricorrente nella letteratura empirica sull'inflazione dell'area
+euro — i tassi di inflazione mostrano tipicamente una persistenza molto vicina
+alla radice unitaria — ma va enunciata con precisione, perché è la prima
+obiezione che un lettore attento solleva. Va aggiunta fra i limiti dichiarati
+del lavoro insieme al caso KPSS appena discusso.
 
 ```{r visualizzazione_differenze}
 # Chunk: visualizzazione_differenze

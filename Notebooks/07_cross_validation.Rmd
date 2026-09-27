@@ -1,7 +1,7 @@
 ---
 title: "07 - Validazione incrociata a finestra espansiva"
 subtitle: "Inflazione Italia - Analisi Econometrica"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -315,8 +315,9 @@ del 4.6% rispetto al miglior ARIMA.
 
 **Questo non contraddice il notebook 06: lo completa.** Il notebook 06 valutava
 esclusivamente il periodo 2023-2026, e la tabella per regime più sotto conferma
-che in quel sotto-periodo l'ARIMA parsimonioso vince davvero. Su un orizzonte di
-vent'anni, però, i guadagni dell'ECM in altre fasi superano quella perdita. Le
+che in quel sotto-periodo l'ARIMA parsimonioso vince davvero. Sui quasi
+diciassette anni coperti qui, però, i guadagni dell'ECM nelle altre fasi
+superano quella perdita. Le
 due conclusioni sono entrambe corrette nei rispettivi campi di validità, e il
 confronto fra le due è di per sé un risultato: **la classifica dei modelli
 dipende dal periodo di valutazione**, e un singolo taglio train/test può
@@ -448,6 +449,14 @@ sensibilmente migliore in circostanze rare, e indistinguibile dagli altri nel
 resto del tempo.* Con eventi rari servono campioni molto più lunghi di 200
 osservazioni per raggiungere la significatività convenzionale.
 
+*Una nota per chi legge la tabella con attenzione: le righe 1 e 3 riportano la
+stessa statistica DM, −0.764, pur avendo differenze medie diverse (−0.0232 e
+−0.0309). Non è un errore di copiatura. La statistica è il rapporto fra
+differenza media ed errore standard HAC, e il confronto con `arima_auto` ha sia
+una differenza più grande sia una varianza più alta: i due effetti si
+compensano quasi esattamente, producendo lo stesso rapporto alla terza cifra
+decimale. È una coincidenza numerica.*
+
 **Il confronto più vicino alla soglia** è `ECM_A5` contro il naive (p = 0.112),
 significativo solo a un livello del 12%. La direzione è quella attesa e il
 margine sostanziale, ma formalmente resta inconcludente.
@@ -460,7 +469,7 @@ in-sample **non si traducono in alcun vantaggio previsivo**, coerentemente con
 la diagnosi delle radici quasi cancellate del notebook 04.
 
 **Il confronto fra i due ECM è altrettanto chiuso**: A8 e A5 sono
-indistinguibili (p = 0.299 su RMSE, 0.607 su MAE), con A5 marginalmente avanti
+indistinguibili (p = 0.299 su RMSE, 0.606 su MAE), con A5 marginalmente avanti
 sull'RMSE e A8 sul MAE. La scelta fra i due, che nel notebook 05 era stata
 lasciata aperta, può essere risolta per parsimonia a favore di **A5**: quattro
 regressori invece di sei, a parità di performance.
@@ -533,10 +542,10 @@ l'inflazione passò dal 5.6% all'1.8% — in cui il random walk sbagliò di quas
 la turbolenza, i modelli smettono di guadagnare e anzi restituiscono qualcosa
 al naive.
 
-**La conclusione è netta**: praticamente tutto il vantaggio accumulato in
-vent'anni dai modelli econometrici sul random walk è prodotto in **tre anni su
-diciassette**, quelli fra il 2020 e il 2023. Negli altri quattordici anni il
-random walk è competitivo.
+**La conclusione è netta**: praticamente tutto il vantaggio che i modelli
+econometrici accumulano sul random walk lungo i sedici anni e otto mesi coperti
+dalla cross-validation è prodotto in **quattro anni su diciassette**, quelli fra
+il 2020 e il 2023. Nei restanti tredici il random walk è competitivo.
 
 Questo spiega perfettamente perché il test di Diebold-Mariano non rifiuta pur
 in presenza di un RMSE relativo di 0.860: un vantaggio reale ma concentrato in
@@ -668,7 +677,7 @@ cv_regimi %>%
 | 2014-2019 bassa inflazione | −0.048 | −0.045 | −0.009 | +0.001 | −0.001 |
 | 2020-2021 pandemia | **+0.046** | +0.061 | +0.140 | +0.131 | +0.154 |
 | 2022 shock energetico | +0.473 | +0.517 | +0.692 | **+0.367** | +0.667 |
-| 2023-2026 disinflazione | −0.299 | −0.302 | −0.202 | **−0.201** | −0.205 |
+| 2023-2026 disinflazione | −0.299 | −0.302 | −0.202 | **−0.201** | −0.204 |
 
 **Il segno rivela la direzione dell'errore**: ME positivo significa che il
 modello ha **sottostimato** l'inflazione, negativo che l'ha **sovrastimata**.
@@ -680,8 +689,10 @@ tratta di meno di mezzo decimo di punto percentuale.
 
 **Durante gli shock tutti sottostimano, ma gli ECM molto meno.** È il risultato
 più significativo della tabella. Nella pandemia gli ECM hanno un ME di +0.046 e
-+0.061 contro +0.154 del naive e +0.131/+0.140 degli ARIMA: una distorsione
-**tre volte inferiore**. Nel 2022 il quadro è simile — ECM_A5 a +0.473 contro
++0.061 contro +0.154 del naive e +0.131/+0.140 degli ARIMA: una distorsione **da
+due a tre volte inferiore** a seconda del confronto (3.4 volte fra `ECM_A5` e il
+naive, 2.3 volte fra `ECM_A8` e l'ARIMA parsimonioso). Nel 2022 il quadro è
+simile — ECM_A5 a +0.473 contro
 +0.667 del naive e +0.692 dell'ARIMA parsimonioso — con la sola eccezione
 dell'`arima_auto`, che qui ha il ME più basso in assoluto (+0.367).
 
@@ -699,9 +710,9 @@ backward-looking potesse prevedere — ma gli ECM lo fanno **di più**: −0.299
 I tre risultati precedenti hanno una sola causa comune, ed è il meccanismo
 stesso di correzione d'errore.
 
-L'equilibrio di lungo periodo stimato implica per l'Italia un'inflazione
-attorno al 2-2.5% nelle condizioni di area euro e petrolio prevalenti nel
-periodo. Per gran parte del campione recente l'inflazione italiana osservata è
+L'equilibrio di lungo periodo stimato implica per l'Italia un'inflazione fra il
+2.3% e il 2.6% nelle condizioni di area euro e petrolio prevalenti nel periodo
+(il calcolo è nel notebook 06). Per gran parte del campione recente l'inflazione italiana osservata è
 stata **sotto** quel livello, quindi l'ECT è rimasto negativo e il meccanismo di
 correzione ha prodotto una **spinta persistente al rialzo**.
 
@@ -729,7 +740,7 @@ osservazioni) isola l'effetto della ristima mensile:
 |---|---|---|
 | ME di ECM_A5 | −0.412 | **−0.299** |
 | ME medio degli altri modelli | −0.165 | −0.203 |
-| **Eccesso di distorsione dell'ECM** | **−0.247** | **−0.096** |
+| **Eccesso di distorsione dell'ECM** | **−0.247** | **−0.097** |
 
 La ristima mensile **non elimina la distorsione, ma ne dimezza abbondantemente
 l'eccesso** rispetto agli altri modelli: da 0.25 punti a 0.10. Aggiornare il
@@ -933,6 +944,6 @@ conclusione locale e una generale.
    dallo scopo di questo lavoro.
 
 5. **Il vantaggio dipende da pochi episodi.** Le conclusioni sulla performance
-   durante gli shock si fondano su 24 osservazioni per la pandemia e 12 per il
-   2022. Sono numerosità sufficienti a essere indicative, non a essere
-   conclusive.
+   durante gli shock si fondano su 24 osservazioni per la pandemia e su 12 per
+   lo shock energetico del 2022. Sono numerosità sufficienti a essere
+   indicative, non a essere conclusive.

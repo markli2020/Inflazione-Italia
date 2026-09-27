@@ -1,7 +1,7 @@
 ---
 title: "04 - Benchmark ARIMA Univariato"
 subtitle: "Inflazione Italia - Analisi Econometrica"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -196,11 +196,19 @@ segnale forte e inequivocabile è quello **stagionale**, mentre la struttura MA
 a corto raggio è debole. `ma1` supera di poco la soglia convenzionale, `ma2`
 non la avvicina nemmeno.
 
-Questo suggerisce che una versione ancora più parsimoniosa —
-ARIMA(0,1,1)(0,0,1)[12] — catturerebbe probabilmente quasi tutta la struttura
-utile di questo modello di controllo. Non la si aggiunge qui per non
-trasformare il benchmark in una ricerca di specificazione a posteriori, ma è
-un'osservazione da riportare nel report.
+Verrebbe da concluderne che una versione ancora più parsimoniosa —
+ARIMA(0,1,1)(0,0,1)\[12\] — catturerebbe quasi tutta la struttura utile di
+questo modello di controllo. **La diagnostica più avanti mostrerà che questa
+conclusione sarebbe sbagliata**: il test di Ljung-Box rifiuta l'ipotesi di
+rumore bianco sui residui di questa specificazione (p = 0.0024), segno che con
+tre parametri resta struttura non catturata. Togliere `ma2` peggiorerebbe la
+situazione invece di migliorarla.
+
+Vale la pena lasciare traccia di questo passaggio invece di riscriverlo a
+posteriori: la non significatività di un singolo coefficiente dice se *quel
+parametro* è distinguibile da zero, non se il modello nel suo complesso sia
+adeguato. Sono due domande diverse, e solo la seconda si risponde con un test
+sui residui.
 
 # Selezione del modello migliore
 
@@ -294,23 +302,171 @@ grafico_residui <- fit_benchmark %>%
 print(grafico_residui)
 ```
 
-**Cosa deve mostrare l'ACF dei residui (pannello in basso a sinistra).** Tutte
-le barre dovrebbero restare dentro le bande di confidenza: significherebbe che
-il modello ha rimosso la struttura di autocorrelazione lineare prevedibile
-dalla propria storia passata, e che i residui si comportano come rumore bianco,
-l'ipotesi fondante dell'approccio di Box-Jenkins. Con 20-24 ritardi testati è
-normale che una o due barre sfiorino il limite per puro caso al 5%: quello che
-conterebbe come problema è una barra che lo supera nettamente, o uno spike
-isolato a un ritardo stagionale (12 o 24), che segnalerebbe stagionalità
-residua non catturata.
+**Come si legge questo pannello.** L'ACF dei residui (in basso a sinistra) è il
+controllo centrale: se il modello ha rimosso tutta l'autocorrelazione lineare
+prevedibile dal passato della serie, i residui si comportano come rumore bianco
+e le barre restano dentro le bande di confidenza. È l'ipotesi fondante
+dell'approccio di Box-Jenkins. Con 20-24 ritardi testati è normale che una o
+due barre sfiorino il limite per puro caso al 5%; conterebbero come problema
+una barra che lo supera nettamente, oppure uno spike isolato a un ritardo
+stagionale (12 o 24), che segnalerebbe stagionalità residua non catturata.
 
-**Cosa aspettarsi dalla serie storica dei residui (pannello in alto) e
-dall'istogramma.** Qui emergerà il limite del modello, non il suo successo: i
-residui oscillano stabilmente per la maggior parte del campione e poi la
-volatilità esplode dal 2021 in poi, con l'istogramma che — pur centrato sullo
-zero e a campana — mostra valori estremi isolati sulla destra (code grasse). È
-la controparte visiva dell'eteroschedasticità che la sezione seguente verifica
-in modo formale.
+Il giudizio a occhio su un correlogramma è però soggettivo, e su 24 barre il
+rischio di leggerci quello che si vuole trovare è concreto. Per questo la
+verifica formale è affidata al test di **Ljung-Box** del chunk seguente, che
+valuta congiuntamente tutti i ritardi e restituisce un p-value invece di una
+impressione visiva. Il grafico serve a vedere *dove* si concentra l'eventuale
+struttura residua; il test a stabilire *se* ce n'è.
+
+La serie storica dei residui (pannello in alto) e l'istogramma raccontano
+invece la seconda questione, la varianza: si guarda se l'ampiezza delle
+oscillazioni resta stabile o se si allarga in corrispondenza degli shock del
+2020-2022, e se l'istogramma presenta code più spesse di quelle di una normale.
+È la controparte visiva dell'eteroschedasticità, che la sezione sul test ARCH
+verifica in modo formale poco più avanti.
+
+```{r test_ljung_box}
+# Chunk: test_ljung_box
+# H0: i primi 24 coefficienti di autocorrelazione dei residui sono tutti nulli
+#     (residui = rumore bianco).
+# lag = 24 copre due cicli stagionali completi, cosi' un'eventuale stagionalita'
+# residua ai ritardi 12 e 24 rientra nel test.
+# dof = numero di parametri stimati dal modello: la statistica va corretta per
+# i gradi di liberta' "consumati" dalla stima, altrimenti il test e' troppo
+# permissivo. Lo leggiamo dall'oggetto stimato invece di scriverlo a mano, cosi'
+# resta corretto anche se in futuro il modello selezionato cambiasse.
+n_parametri <- fit_benchmark %>%
+  dplyr::select(all_of(modello_migliore)) %>%
+  tidy() %>%
+  nrow()
+
+cat("Parametri stimati dal modello selezionato:", n_parametri, "\n\n")
+
+ljung_box_residui <- fit_benchmark %>%
+  dplyr::select(all_of(modello_migliore)) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 24, dof = n_parametri)
+
+ljung_box_residui
+```
+
+**Come leggere il risultato.** L'ipotesi nulla del test è che i residui siano
+rumore bianco. Un p-value **alto** (sopra 0.05) è quindi il risultato
+desiderato: significa che non si trova evidenza di autocorrelazione residua e
+che il benchmark è ben specificato. Un p-value basso indicherebbe struttura
+ancora presente, e imporrebbe di tornare sulla specificazione prima di usare
+questo modello come termine di paragone.
+
+Si noti che questo test riguarda la **media** condizionata, non la varianza:
+può passare senza problemi anche su una serie fortemente eteroschedastica. Sono
+due diagnostiche indipendenti, e il test ARCH più sotto si occupa della seconda.
+
+### Esito del test
+
+**Il benchmark passa, e con ampio margine.** La statistica vale **8.13** con un
+p-value di **0.977**: non c'è alcuna evidenza di autocorrelazione residua fino
+al ritardo 24, ritardi stagionali 12 e 24 inclusi. Sotto il profilo della media
+condizionata il modello è ben specificato, e usarlo come termine di paragone è
+legittimo.
+
+**Un dettaglio che vale la pena notare, però.** Con `lag = 24` e `dof = 6` la
+statistica si distribuisce come un chi-quadro a **18 gradi di libertà**, il cui
+valore atteso è per l'appunto 18. Il valore osservato, 8.13, è meno della metà.
+Su residui che fossero autentico rumore bianco ci si aspetterebbe una statistica
+attorno a 18, con oscillazione campionaria: un valore così basso significa che
+le autocorrelazioni residue sono *sistematicamente più piccole* di quanto il
+caso da solo produrrebbe.
+
+Due letture sono compatibili con questo numero. La prima è la
+**sovra-parametrizzazione**: il modello avrebbe assorbito, oltre alla struttura
+vera, anche parte del rumore campionario, il che si combinerebbe con le radici
+quasi cancellate individuate sopra. La seconda è che il modello stia
+semplicemente catturando bene la struttura, e che un valore basso rientri
+nell'oscillazione campionaria di una singola realizzazione.
+
+Il test da solo non separa le due ipotesi, e sarebbe scorretto presentare la
+prima come dimostrata. Il chunk seguente le mette a confronto applicando la
+stessa diagnostica al modello parsimonioso: se un modello con metà dei
+parametri risultasse anch'esso pulito, la lettura di sovra-parametrizzazione
+sarebbe corroborata; se invece lasciasse struttura residua, significherebbe che
+quei parametri in più stanno facendo un lavoro reale.
+
+```{r ljung_box_confronto}
+# Chunk: ljung_box_confronto
+# Stesso test sul modello di controllo. Il confronto interessante non e' il
+# p-value (che entrambi supereranno) ma il rapporto fra statistica e gradi di
+# liberta': un modello ben calibrato produce una statistica vicina ai propri
+# gradi di liberta', uno sovra-parametrizzato una statistica molto piu' bassa.
+lb_di_un_modello <- function(nome_modello) {
+
+  singolo <- fit_benchmark %>% dplyr::select(all_of(nome_modello))
+
+  n_par <- singolo %>% tidy() %>% nrow()
+
+  esito <- singolo %>%
+    augment() %>%
+    features(.innov, ljung_box, lag = 24, dof = n_par)
+
+  tibble(
+    modello   = nome_modello,
+    n_par     = n_par,
+    gdl       = 24 - n_par,
+    lb_stat   = round(esito$lb_stat,   3),
+    lb_pvalue = round(esito$lb_pvalue, 4),
+    rapporto  = round(esito$lb_stat / (24 - n_par), 3)
+  )
+}
+
+ljung_box_confronto <- c("arima_auto", "arima_parsimonioso") %>%
+  map(lb_di_un_modello) %>%
+  list_rbind()
+
+ljung_box_confronto
+```
+
+La colonna `rapporto` è la grandezza da guardare: è la statistica divisa per i
+propri gradi di libertà, e su residui genuinamente incorrelati dovrebbe
+aggirarsi intorno a **1**, dato che il valore atteso di un chi-quadro coincide
+con i suoi gradi di libertà.
+
+### Il confronto smentisce l'ipotesi di sovra-parametrizzazione
+
+Il risultato è netto e va nella direzione **opposta** a quella ipotizzata sopra:
+
+| Modello              | Parametri | gdl | Statistica | p-value    | Rapporto |
+|----------------------|-----------|-----|------------|------------|----------|
+| `arima_auto`         | 6         | 18  | 8.13       | 0.977      | 0.45     |
+| `arima_parsimonioso` | 3         | 21  | 43.90      | **0.0024** | 2.09     |
+
+**Il modello parsimonioso fallisce il test.** Con un p-value di 0.0024 l'ipotesi
+di rumore bianco è rifiutata all'1%: nei suoi residui resta autocorrelazione
+sostanziale, cioè struttura che il modello non ha catturato. Il rapporto 2.09,
+più che doppio rispetto al valore atteso, quantifica quanta.
+
+Questo obbliga a rivedere la lettura del paragrafo precedente. Se
+l'alternativa a tre parametri lascia struttura vera non modellata, il rapporto
+0.45 di `arima_auto` diventa difficile da attribuire al solo adattamento del
+rumore: **almeno una parte dei tre parametri aggiuntivi sta catturando segnale
+reale**, coerentemente con la riduzione del 12% della varianza residua già
+osservata. L'ipotesi di sovra-parametrizzazione, plausibile guardando un solo
+modello, non regge al confronto diretto.
+
+**Cosa resta valido e cosa no.** Le radici quasi cancellate fra `ar1` e `ma1`
+restano un problema di identificazione autentico: due parametri che si elidono
+quasi esattamente sono mal determinati a prescindere da come si comportino i
+residui, e la cautela sui loro errori standard resta dovuta. Quello che cade è
+l'idea che si tratti di *tre* evidenze convergenti: il Ljung-Box, letto
+correttamente, non sostiene quella tesi, e presentarlo come se lo facesse
+sarebbe stato un errore di interpretazione.
+
+**Conseguenza per il notebook 06.** Il modello di controllo va portato al
+confronto fuori campione, come previsto, ma **dichiarando che fallisce la
+diagnostica sui residui**: non è un benchmark valido in sé, è un termine di
+paragone deliberatamente più semplice. Se nonostante la mis-specificazione
+prevedesse meglio di `arima_auto`, il risultato sarebbe più interessante, non
+meno: mostrerebbe che un modello statisticamente inadeguato in-sample può
+battere fuori campione uno ben specificato ma fragile nell'identificazione. La
+verifica spetta al test set.
 
 **Il punto per la tesi.** Il benchmark raggiunge qui il suo limite strutturale.
 Avendo a disposizione solo la propria storia passata, un ARIMA univariato non
@@ -423,4 +579,6 @@ saveRDS(modello_migliore,  here("Data", "Processed", "modello_migliore_benchmark
 | Selezione via AICc, non AIC | Criterio corretto per campioni non enormi |
 | Selezione del vincitore via codice | Riproducibilità: la scelta si aggiorna da sola se i dati cambiano |
 | **Entrambi i modelli portati al confronto out-of-sample** | `arima_auto` vince in-sample ma ha radici quasi cancellate, un fattore di rischio fuori campione: decide il test set |
+| Ljung-Box su entrambi i modelli, non solo sul vincitore | Il confronto ha smentito l'ipotesi di sovra-parametrizzazione di `arima_auto` e rivelato che il modello di controllo è mis-specificato (p = 0.0024) |
+| `arima_parsimonioso` portato avanti pur fallendo il Ljung-Box | Resta un termine di paragone deliberatamente semplice; la mis-specificazione va dichiarata, non nascosta |
 | Benchmark = ARIMA puro, senza estensione GARCH | Il GARCH modella la varianza, non la media: non migliorerebbe RMSE/MAE, che sono le metriche del confronto |

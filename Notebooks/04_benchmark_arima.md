@@ -1,0 +1,660 @@
+04 - Benchmark ARIMA Univariato
+================
+
+# Obiettivo del notebook
+
+Prima di stimare il modello ECM costruiamo un **benchmark solido**: un
+ARIMA univariato stimato solo sulla storia di `hicp_it`, senza alcuna
+variabile esplicativa. Il benchmark rappresenta la soglia minima da
+superare — se l’ECM non lo batte fuori campione (RMSE/MAE sul test set),
+la relazione di cointegrazione dimostrata nel notebook 03 non porta
+vantaggi operativi rispetto a un modello che guarda solo al proprio
+passato.
+
+Perché un benchmark onesto conta: è facile costruire un modello
+complesso che vince contro un avversario debole. Scegliere invece il
+miglior ARIMA possibile rende il confronto informativo — se l’ECM vince
+contro un benchmark ben specificato, il risultato ha valore.
+
+La strategia è in tre passi: identificazione (ACF/PACF), stima e
+selezione (modello automatico contro modello parsimonioso, via AICc),
+diagnostica (residui ed eteroschedasticità).
+
+# Caricamento dati
+
+``` r
+# Chunk: caricamento_dati
+# Carichiamo train (livello) e train trasformato (differenziato) salvati dal
+# notebook 02.
+df_train       <- readRDS(here("Data", "Processed", "df_train.rds"))
+df_train_trans <- readRDS(here("Data", "Processed", "df_train_trans.rds"))
+```
+
+Due oggetti già preparati nel notebook 02: `df_train` (livelli, serve
+per stimare l’ARIMA, che applicherà internamente la differenza) e
+`df_train_trans` (già differenziata, serve solo per l’identificazione
+visiva ACF/PACF). Ci si appoggia agli RDS salvati invece di riprodurre
+le trasformazioni qui, per garantire coerenza fra notebook.
+
+# Identificazione: radiografia ACF/PACF
+
+``` r
+# Chunk: radiografia_acf_pacf
+# ACF/PACF sulla serie GIA' differenziata (d_hicp_it, stazionaria - notebook 02)
+# per individuare i parametri p e q del benchmark ARIMA.
+grafico_autocorr <- df_train_trans %>%
+  gg_tsdisplay(d_hicp_it, plot_type = "partial")
+
+print(grafico_autocorr)
+```
+
+![](04_benchmark_arima_files/figure-gfm/radiografia_acf_pacf-1.png)<!-- -->
+
+**Pannello superiore (serie differenziata).** `d_hicp_it` oscilla
+attorno a zero senza trend, conferma visiva che la differenza ordinaria
+ha rimosso la componente di livello, coerentemente con i test di radice
+unitaria del notebook 02. Dal 2020 in poi l’ampiezza delle oscillazioni
+cresce nettamente, con uno spike che supera 3 nel 2022 (shock
+energetico): è il primo segnale visivo di eteroschedasticità, su cui si
+torna più avanti in modo formale.
+
+**Pannelli ACF e PACF.** Diversi ritardi a corto raggio — attorno a 3,
+4, 6 e 7 — superano la banda di confidenza in entrambi i grafici, con un
+decadimento graduale invece di un taglio netto dopo un singolo ritardo.
+È il profilo tipico di una struttura mista a breve termine, non di un
+processo puramente AR o puramente MA.
+
+Il segnale più netto è però al **ritardo 12**: uno spike isolato e
+negativo, ben oltre la banda in entrambi i grafici e particolarmente
+marcato nella PACF (circa −0.25). Con dati mensili il ritardo 12
+corrisponde a un anno: è la firma classica di una componente
+**stagionale**.
+
+**Interpretazione econometrica.** Il pattern è compatibile con una
+struttura MA a corto raggio più una componente MA stagionale al ritardo
+12, cioè un modello della famiglia **ARIMA(0,1,q)(0,0,1)\[12\]** — la
+struttura che giustifica il modello parsimonioso stimato più sotto. La
+scelta di **non differenziare stagionalmente** (D = 0) è supportata dal
+fatto che lo spike al lag 12 appare come autocorrelazione residua
+isolata, non come lenta decadenza ai ritardi stagionali successivi (12,
+24, 36…), che avrebbe invece richiesto D = 1.
+
+# Stima dei modelli benchmark
+
+``` r
+# Chunk: stima_modelli_benchmark
+# Stimiamo due modelli per un confronto rigoroso:
+# 1. Il modello flessibile: ricerca automatica su un ampio spazio di ordini
+# 2. Il modello parsimonioso: ordine imposto manualmente (utile per evitare
+#    radici cancellate/instabilita' numerica che a volte l'auto-search produce)
+
+fit_benchmark <- df_train %>%
+  # 1. BLINDATURA DEI DATI: Forziamo la frequenza mensile e il tipo numerico
+  mutate(
+    date = yearmonth(date),
+    hicp_it = as.numeric(hicp_it)
+  ) %>%
+  # 2. Creiamo il tsibble (fill_gaps assicura che non ci siano mesi saltati)
+  as_tsibble(index = date) %>%
+  tsibble::fill_gaps() %>%
+
+  # 3. Stimiamo i modelli esplicitando il namespace fable::
+  model(
+    arima_auto         = fable::ARIMA(hicp_it ~ pdq(0:4, 1, 0:4) + PDQ(0:2, 0, 0:2)),
+    arima_parsimonioso = fable::ARIMA(hicp_it ~ pdq(0, 1, 2) + PDQ(0, 0, 1))
+  )
+```
+
+**Perché due modelli e non solo la ricerca automatica.** `arima_auto`
+esplora un intervallo ampio (p, q ∈ \[0,4\], P, Q ∈ \[0,2\], con d = 1 e
+D = 0 fissati in base ai test del notebook 02) tramite l’algoritmo
+passo-passo di Hyndman-Khandakar. `arima_parsimonioso` è invece un
+**modello di controllo**, con ordine imposto a mano sulla base della
+radiografia ACF/PACF: serve a verificare se il guadagno di fit della
+ricerca automatica è sostanziale, e a proteggersi dal rischio — non raro
+nelle ricerche su spazi ampi — di selezionare un modello con **radici
+quasi cancellate**, cioè con un fattore autoregressivo e uno a media
+mobile che si elidono a vicenda, numericamente instabile e poco
+identificato anche se formalmente ottimo per AICc.
+
+Come si vedrà più sotto, questo controllo si è rivelato tutt’altro che
+teorico.
+
+**Perché la “blindatura” dei dati.** `fable::ARIMA()` con il namespace
+esplicito evita un problema già incontrato in questo progetto: `FinTS`,
+caricato in questo stesso notebook, ha una propria funzione `ARIMA()`
+che **nasconde** `fable::ARIMA()` — esattamente come `MASS::select`
+nascondeva `dplyr::select()` in un notebook precedente. La coercizione
+di `date` a `yearmonth` e di `hicp_it` a `numeric`, più `fill_gaps()`,
+eliminano altre due classi di errori ricorrenti (indice del tsibble
+irregolare, colonne non numeriche ereditate da join precedenti) che
+causerebbero fallimenti poco chiari dentro la funzione.
+
+# Confronto dei criteri di informazione
+
+``` r
+# Chunk: confronto_criteri
+# glance() mostra una tabella riassuntiva. Il modello con l'AICc PIU' BASSO
+# e' il vincitore statistico.
+confronto_criteri <- glance(fit_benchmark) %>%
+  dplyr::select(.model, AIC, AICc, BIC)
+
+confronto_criteri
+```
+
+    ## # A tibble: 2 × 4
+    ##   .model               AIC  AICc   BIC
+    ##   <chr>              <dbl> <dbl> <dbl>
+    ## 1 arima_auto          246.  246.  272.
+    ## 2 arima_parsimonioso  282.  282.  297.
+
+### Interpretazione
+
+| Modello              | AIC        | AICc       | BIC        |
+|----------------------|------------|------------|------------|
+| `arima_auto`         | **245.77** | **246.14** | **271.95** |
+| `arima_parsimonioso` | 281.65     | 281.78     | 296.61     |
+
+Il criterio corretto da leggere è l’**AICc**, corretto per campioni non
+enormi, non l’AIC grezzo. La differenza è di **35.6 punti** a favore del
+modello automatico.
+
+Secondo la regola convenzionale (Burnham & Anderson), una differenza di
+AICc superiore a 10 punti indica che il modello con l’AICc più alto ha
+un supporto empirico trascurabile rispetto all’altro. Con 35.6 punti il
+divario è netto, e il BIC — che penalizza la complessità più severamente
+— conferma la stessa gerarchia (271.95 contro 296.61), quindi non si
+tratta solo di un effetto del maggior numero di parametri.
+
+Il confronto delle varianze residue lo conferma sul piano sostanziale:
+σ² = 0.1249 per il modello automatico contro 0.1421 per il parsimonioso,
+una **riduzione del 12%**. Il modello automatico non sta semplicemente
+sfruttando più parametri: cattura struttura reale.
+
+``` r
+# Chunk: dettaglio_modello_parsimonioso
+report(fit_benchmark %>% dplyr::select(arima_parsimonioso))
+```
+
+    ## Series: hicp_it 
+    ## Model: ARIMA(0,1,2)(0,0,1)[12] 
+    ## 
+    ## Coefficients:
+    ##          ma1     ma2     sma1
+    ##       0.1204  0.0344  -0.2552
+    ## s.e.  0.0580  0.0505   0.0638
+    ## 
+    ## sigma^2 estimated as 0.1421:  log likelihood=-136.83
+    ## AIC=281.65   AICc=281.78   BIC=296.61
+
+### Interpretazione del modello parsimonioso
+
+Modello stimato: **ARIMA(0,1,2)(0,0,1)\[12\]**. Valutando il rapporto
+coefficiente/errore standard (una stima grezza della significatività:
+sotto 2 in valore assoluto il coefficiente non è chiaramente
+distinguibile da zero):
+
+| Coefficiente | Stima   | s.e.   | Rapporto  | Lettura                         |
+|--------------|---------|--------|-----------|---------------------------------|
+| `sma1`       | −0.2552 | 0.0638 | **−4.00** | chiaramente significativo       |
+| `ma1`        | 0.1204  | 0.0580 | 2.08      | al limite della significatività |
+| `ma2`        | 0.0344  | 0.0505 | 0.68      | non significativo               |
+
+Il quadro conferma esattamente la lettura della radiografia ACF/PACF: il
+segnale forte e inequivocabile è quello **stagionale**, mentre la
+struttura MA a corto raggio è debole. `ma1` supera di poco la soglia
+convenzionale, `ma2` non la avvicina nemmeno.
+
+Verrebbe da concluderne che una versione ancora più parsimoniosa —
+ARIMA(0,1,1)(0,0,1)$$12$$ — catturerebbe quasi tutta la struttura utile
+di questo modello di controllo. **La diagnostica più avanti mostrerà che
+questa conclusione sarebbe sbagliata**: il test di Ljung-Box rifiuta
+l’ipotesi di rumore bianco sui residui di questa specificazione (p =
+0.0024), segno che con tre parametri resta struttura non catturata.
+Togliere `ma2` peggiorerebbe la situazione invece di migliorarla.
+
+Vale la pena lasciare traccia di questo passaggio invece di riscriverlo
+a posteriori: la non significatività di un singolo coefficiente dice se
+*quel parametro* è distinguibile da zero, non se il modello nel suo
+complesso sia adeguato. Sono due domande diverse, e solo la seconda si
+risponde con un test sui residui.
+
+# Selezione del modello migliore
+
+``` r
+# Chunk: selezione_modello_migliore
+# Selezioniamo automaticamente il modello con l'AICc piu' basso per la
+# diagnostica dei residui, invece di scegliere "a occhio" quale dei due usare.
+modello_migliore <- confronto_criteri %>%
+  slice_min(AICc, n = 1) %>%
+  pull(.model)
+
+modello_migliore
+```
+
+    ## [1] "arima_auto"
+
+Selezionarlo via codice, e non a occhio sulla tabella, rende il notebook
+riproducibile: se in futuro i dati venissero aggiornati, la scelta del
+modello da diagnosticare si aggiornerebbe da sola.
+
+``` r
+# Chunk: dettaglio_modello_migliore
+# Il report() sopra mostrava arima_parsimonioso; qui stampiamo l'ordine e i
+# coefficienti del modello effettivamente selezionato, necessari per
+# interpretare correttamente la diagnostica dei residui che segue.
+report(fit_benchmark %>% dplyr::select(all_of(modello_migliore)))
+```
+
+    ## Series: hicp_it 
+    ## Model: ARIMA(1,1,3)(0,0,2)[12] 
+    ## 
+    ## Coefficients:
+    ##          ar1      ma1      ma2     ma3     sma1    sma2
+    ##       0.9682  -0.9662  -0.0529  0.2140  -0.3458  0.1195
+    ## s.e.  0.0278   0.0611   0.0735  0.0584   0.0694  0.0658
+    ## 
+    ## sigma^2 estimated as 0.1249:  log likelihood=-115.88
+    ## AIC=245.77   AICc=246.14   BIC=271.95
+
+## Il modello vincente e un problema di identificazione
+
+Il modello selezionato è un **ARIMA(1,1,3)(0,0,2)\[12\]**:
+
+| Coefficiente | Stima   | s.e.   | Rapporto |
+|--------------|---------|--------|----------|
+| `ar1`        | 0.9682  | 0.0278 | 34.83    |
+| `ma1`        | −0.9662 | 0.0611 | −15.81   |
+| `ma2`        | −0.0529 | 0.0735 | −0.72    |
+| `ma3`        | 0.2140  | 0.0584 | 3.66     |
+| `sma1`       | −0.3458 | 0.0694 | −4.98    |
+| `sma2`       | 0.1195  | 0.0658 | 1.82     |
+
+**Il punto che richiede attenzione: `ar1` e `ma1` sono quasi opposti.**
+Il coefficiente autoregressivo vale 0.9682 e il primo coefficiente a
+media mobile −0.9662: i corrispondenti fattori polinomiali, (1 −
+0.9682B) e (1 − 0.9662B), differiscono di due millesimi e **si elidono
+quasi esattamente**.
+
+È la condizione di **radici quasi cancellate**, cioè precisamente la
+patologia che il modello parsimonioso di controllo era stato introdotto
+per intercettare. Le conseguenze pratiche sono tre:
+
+-   i due coefficienti non sono identificati in modo affidabile:
+    infinite coppie di valori vicini produrrebbero un fit quasi
+    identico, quindi i rispettivi errori standard vanno letti con
+    cautela;
+-   l’apparente significatività elevatissima di `ar1` (rapporto 34.8) è
+    ingannevole — misura la precisione con cui è stimato *quel*
+    parametro dato l’altro, non l’importanza del termine nel modello;
+-   modelli con questa caratteristica tendono a comportarsi **peggio
+    fuori campione** di quanto l’AICc in-sample suggerisca, perché parte
+    della loro capacità di adattamento è assorbita da una struttura
+    ridondante.
+
+**Cosa resta di solido nel modello.** La cancellazione non è perfetta e
+non riguarda tutti i termini. I coefficienti `ma3` (rapporto 3.66) e
+`sma1` (−4.98) sono robusti e portano informazione reale:
+rispettivamente una memoria a tre mesi e la componente stagionale
+annuale, quest’ultima coerente con il `sma1 = −0.2552` del modello
+parsimonioso. `ma2` e `sma2` non sono significativi.
+
+**La decisione.** Non si scarta il modello automatico — vince nettamente
+su AICc e BIC e riduce la varianza residua del 12%, quindi cattura
+struttura che il parsimonioso non coglie. Ma dato che la metrica
+decisiva di questo progetto è la performance **fuori campione**, e dato
+che le radici quasi cancellate sono un fattore di rischio proprio su
+quel fronte, la scelta metodologicamente più onesta è **portare entrambi
+i modelli nel confronto finale del notebook 06** e lasciare che sia il
+test set a decidere.
+
+Non è una complicazione gratuita: se il modello parsimonioso, più
+semplice e ben identificato, prevedesse meglio nonostante i 35 punti di
+AICc di svantaggio, sarebbe un risultato interessante di per sé — un
+esempio concreto di divergenza fra selezione in-sample e performance
+out-of-sample, che in tesi vale più di una vittoria scontata.
+
+# Diagnostica dei residui
+
+``` r
+# Chunk: diagnostica_residui
+# Controlliamo se il modello selezionato ha pulito tutta l'autocorrelazione
+# lineare, e se emergono segnali di eteroschedasticita' nella serie storica
+# dei residui.
+grafico_residui <- fit_benchmark %>%
+  dplyr::select(all_of(modello_migliore)) %>%
+  gg_tsresiduals()
+
+print(grafico_residui)
+```
+
+![](04_benchmark_arima_files/figure-gfm/diagnostica_residui-1.png)<!-- -->
+
+**Come si legge questo pannello.** L’ACF dei residui (in basso a
+sinistra) è il controllo centrale: se il modello ha rimosso tutta
+l’autocorrelazione lineare prevedibile dal passato della serie, i
+residui si comportano come rumore bianco e le barre restano dentro le
+bande di confidenza. È l’ipotesi fondante dell’approccio di Box-Jenkins.
+Con 20-24 ritardi testati è normale che una o due barre sfiorino il
+limite per puro caso al 5%; conterebbero come problema una barra che lo
+supera nettamente, oppure uno spike isolato a un ritardo stagionale (12
+o 24), che segnalerebbe stagionalità residua non catturata.
+
+Il giudizio a occhio su un correlogramma è però soggettivo, e su 24
+barre il rischio di leggerci quello che si vuole trovare è concreto. Per
+questo la verifica formale è affidata al test di **Ljung-Box** del chunk
+seguente, che valuta congiuntamente tutti i ritardi e restituisce un
+p-value invece di una impressione visiva. Il grafico serve a vedere
+*dove* si concentra l’eventuale struttura residua; il test a stabilire
+*se* ce n’è.
+
+La serie storica dei residui (pannello in alto) e l’istogramma
+raccontano invece la seconda questione, la varianza: si guarda se
+l’ampiezza delle oscillazioni resta stabile o se si allarga in
+corrispondenza degli shock del 2020-2022, e se l’istogramma presenta
+code più spesse di quelle di una normale. È la controparte visiva
+dell’eteroschedasticità, che la sezione sul test ARCH verifica in modo
+formale poco più avanti.
+
+``` r
+# Chunk: test_ljung_box
+# H0: i primi 24 coefficienti di autocorrelazione dei residui sono tutti nulli
+#     (residui = rumore bianco).
+# lag = 24 copre due cicli stagionali completi, cosi' un'eventuale stagionalita'
+# residua ai ritardi 12 e 24 rientra nel test.
+# dof = numero di parametri stimati dal modello: la statistica va corretta per
+# i gradi di liberta' "consumati" dalla stima, altrimenti il test e' troppo
+# permissivo. Lo leggiamo dall'oggetto stimato invece di scriverlo a mano, cosi'
+# resta corretto anche se in futuro il modello selezionato cambiasse.
+n_parametri <- fit_benchmark %>%
+  dplyr::select(all_of(modello_migliore)) %>%
+  tidy() %>%
+  nrow()
+
+cat("Parametri stimati dal modello selezionato:", n_parametri, "\n\n")
+```
+
+    ## Parametri stimati dal modello selezionato: 6
+
+``` r
+ljung_box_residui <- fit_benchmark %>%
+  dplyr::select(all_of(modello_migliore)) %>%
+  augment() %>%
+  features(.innov, ljung_box, lag = 24, dof = n_parametri)
+
+ljung_box_residui
+```
+
+    ## # A tibble: 1 × 3
+    ##   .model     lb_stat lb_pvalue
+    ##   <chr>        <dbl>     <dbl>
+    ## 1 arima_auto    8.13     0.977
+
+**Come leggere il risultato.** L’ipotesi nulla del test è che i residui
+siano rumore bianco. Un p-value **alto** (sopra 0.05) è quindi il
+risultato desiderato: significa che non si trova evidenza di
+autocorrelazione residua e che il benchmark è ben specificato. Un
+p-value basso indicherebbe struttura ancora presente, e imporrebbe di
+tornare sulla specificazione prima di usare questo modello come termine
+di paragone.
+
+Si noti che questo test riguarda la **media** condizionata, non la
+varianza: può passare senza problemi anche su una serie fortemente
+eteroschedastica. Sono due diagnostiche indipendenti, e il test ARCH più
+sotto si occupa della seconda.
+
+### Esito del test
+
+**Il benchmark passa, e con ampio margine.** La statistica vale **8.13**
+con un p-value di **0.977**: non c’è alcuna evidenza di autocorrelazione
+residua fino al ritardo 24, ritardi stagionali 12 e 24 inclusi. Sotto il
+profilo della media condizionata il modello è ben specificato, e usarlo
+come termine di paragone è legittimo.
+
+**Un dettaglio che vale la pena notare, però.** Con `lag = 24` e
+`dof = 6` la statistica si distribuisce come un chi-quadro a **18 gradi
+di libertà**, il cui valore atteso è per l’appunto 18. Il valore
+osservato, 8.13, è meno della metà. Su residui che fossero autentico
+rumore bianco ci si aspetterebbe una statistica attorno a 18, con
+oscillazione campionaria: un valore così basso significa che le
+autocorrelazioni residue sono *sistematicamente più piccole* di quanto
+il caso da solo produrrebbe.
+
+Due letture sono compatibili con questo numero. La prima è la
+**sovra-parametrizzazione**: il modello avrebbe assorbito, oltre alla
+struttura vera, anche parte del rumore campionario, il che si
+combinerebbe con le radici quasi cancellate individuate sopra. La
+seconda è che il modello stia semplicemente catturando bene la
+struttura, e che un valore basso rientri nell’oscillazione campionaria
+di una singola realizzazione.
+
+Il test da solo non separa le due ipotesi, e sarebbe scorretto
+presentare la prima come dimostrata. Il chunk seguente le mette a
+confronto applicando la stessa diagnostica al modello parsimonioso: se
+un modello con metà dei parametri risultasse anch’esso pulito, la
+lettura di sovra-parametrizzazione sarebbe corroborata; se invece
+lasciasse struttura residua, significherebbe che quei parametri in più
+stanno facendo un lavoro reale.
+
+``` r
+# Chunk: ljung_box_confronto
+# Stesso test sul modello di controllo. Il confronto interessante non e' il
+# p-value (che entrambi supereranno) ma il rapporto fra statistica e gradi di
+# liberta': un modello ben calibrato produce una statistica vicina ai propri
+# gradi di liberta', uno sovra-parametrizzato una statistica molto piu' bassa.
+lb_di_un_modello <- function(nome_modello) {
+
+  singolo <- fit_benchmark %>% dplyr::select(all_of(nome_modello))
+
+  n_par <- singolo %>% tidy() %>% nrow()
+
+  esito <- singolo %>%
+    augment() %>%
+    features(.innov, ljung_box, lag = 24, dof = n_par)
+
+  tibble(
+    modello   = nome_modello,
+    n_par     = n_par,
+    gdl       = 24 - n_par,
+    lb_stat   = round(esito$lb_stat,   3),
+    lb_pvalue = round(esito$lb_pvalue, 4),
+    rapporto  = round(esito$lb_stat / (24 - n_par), 3)
+  )
+}
+
+ljung_box_confronto <- c("arima_auto", "arima_parsimonioso") %>%
+  map(lb_di_un_modello) %>%
+  list_rbind()
+
+ljung_box_confronto
+```
+
+    ## # A tibble: 2 × 6
+    ##   modello            n_par   gdl lb_stat lb_pvalue rapporto
+    ##   <chr>              <int> <dbl>   <dbl>     <dbl>    <dbl>
+    ## 1 arima_auto             6    18    8.13    0.977     0.451
+    ## 2 arima_parsimonioso     3    21   43.9     0.0024    2.09
+
+La colonna `rapporto` è la grandezza da guardare: è la statistica divisa
+per i propri gradi di libertà, e su residui genuinamente incorrelati
+dovrebbe aggirarsi intorno a **1**, dato che il valore atteso di un
+chi-quadro coincide con i suoi gradi di libertà.
+
+### Il confronto smentisce l’ipotesi di sovra-parametrizzazione
+
+Il risultato è netto e va nella direzione **opposta** a quella
+ipotizzata sopra:
+
+| Modello              | Parametri | gdl | Statistica | p-value    | Rapporto |
+|----------------------|-----------|-----|------------|------------|----------|
+| `arima_auto`         | 6         | 18  | 8.13       | 0.977      | 0.45     |
+| `arima_parsimonioso` | 3         | 21  | 43.90      | **0.0024** | 2.09     |
+
+**Il modello parsimonioso fallisce il test.** Con un p-value di 0.0024
+l’ipotesi di rumore bianco è rifiutata all’1%: nei suoi residui resta
+autocorrelazione sostanziale, cioè struttura che il modello non ha
+catturato. Il rapporto 2.09, più che doppio rispetto al valore atteso,
+quantifica quanta.
+
+Questo obbliga a rivedere la lettura del paragrafo precedente. Se
+l’alternativa a tre parametri lascia struttura vera non modellata, il
+rapporto 0.45 di `arima_auto` diventa difficile da attribuire al solo
+adattamento del rumore: **almeno una parte dei tre parametri aggiuntivi
+sta catturando segnale reale**, coerentemente con la riduzione del 12%
+della varianza residua già osservata. L’ipotesi di
+sovra-parametrizzazione, plausibile guardando un solo modello, non regge
+al confronto diretto.
+
+**Cosa resta valido e cosa no.** Le radici quasi cancellate fra `ar1` e
+`ma1` restano un problema di identificazione autentico: due parametri
+che si elidono quasi esattamente sono mal determinati a prescindere da
+come si comportino i residui, e la cautela sui loro errori standard
+resta dovuta. Quello che cade è l’idea che si tratti di *tre* evidenze
+convergenti: il Ljung-Box, letto correttamente, non sostiene quella
+tesi, e presentarlo come se lo facesse sarebbe stato un errore di
+interpretazione.
+
+**Conseguenza per il notebook 06.** Il modello di controllo va portato
+al confronto fuori campione, come previsto, ma **dichiarando che
+fallisce la diagnostica sui residui**: non è un benchmark valido in sé,
+è un termine di paragone deliberatamente più semplice. Se nonostante la
+mis-specificazione prevedesse meglio di `arima_auto`, il risultato
+sarebbe più interessante, non meno: mostrerebbe che un modello
+statisticamente inadeguato in-sample può battere fuori campione uno ben
+specificato ma fragile nell’identificazione. La verifica spetta al test
+set.
+
+**Il punto per la tesi.** Il benchmark raggiunge qui il suo limite
+strutturale. Avendo a disposizione solo la propria storia passata, un
+ARIMA univariato non può in alcun modo anticipare uno shock esogeno come
+quello energetico del 2021-2022: per definizione quell’informazione non
+è nel passato di `hicp_it` prima che lo shock accada. È esattamente
+l’argomento che giustifica il passaggio a un modello che incorpora
+informazione esterna — inflazione europea e petrolio — cioè l’ECM del
+notebook successivo.
+
+# Test per effetti ARCH (test LM di Engle)
+
+Il test LM di Engle (1982) regredisce i residui al quadrato sui propri
+ritardi. L’ipotesi nulla è **assenza di effetti ARCH**: se viene
+rifiutata, la varianza degli errori è in parte prevedibile a partire
+dagli shock passati, e l’assunzione di omoschedasticità del rumore
+bianco è violata.
+
+``` r
+# Chunk: test_arch
+# Estraiamo i residui del modello selezionato e applichiamo il test LM a due
+# orizzonti diversi: ritardo 1 (persistenza minima, mese su mese) e ritardo 12
+# (eteroschedasticita' distribuita su un anno).
+residui <- fit_benchmark %>%
+  dplyr::select(all_of(modello_migliore)) %>%
+  residuals() %>%
+  pull(.resid)
+
+# H0: assenza di effetti ARCH al ritardo 1
+arch_test_1 <- FinTS::ArchTest(residui, lags = 1)
+arch_test_1
+```
+
+    ## 
+    ##  ARCH LM-test; Null hypothesis: no ARCH effects
+    ## 
+    ## data:  residui
+    ## Chi-squared = 0.22963, df = 1, p-value = 0.6318
+
+``` r
+# H0: assenza di effetti ARCH fino al ritardo 12
+arch_test_12 <- FinTS::ArchTest(residui, lags = 12)
+arch_test_12
+```
+
+    ## 
+    ##  ARCH LM-test; Null hypothesis: no ARCH effects
+    ## 
+    ## data:  residui
+    ## Chi-squared = 40.327, df = 12, p-value = 6.345e-05
+
+### Interpretazione
+
+| Test        | Chi-quadro | gdl | p-value   | Esito          |
+|-------------|------------|-----|-----------|----------------|
+| ARCH-LM(1)  | 0.230      | 1   | 0.632     | non rifiuta H0 |
+| ARCH-LM(12) | 40.327     | 12  | 6.35·10⁻⁵ | **rifiuta H0** |
+
+**Al ritardo 1 non emerge alcun effetto ARCH.** Il p-value di 0.632 è
+ampiamente sopra qualunque soglia convenzionale: la varianza di un mese
+non è prevedibile a partire dal solo shock del mese precedente. Presa
+isolatamente, l’incertezza del mese scorso non spiega quella di questo
+mese.
+
+**Al ritardo 12 l’ipotesi nulla è rifiutata con forza.** Il p-value
+crolla a 6.3·10⁻⁵. Il volatility clustering osservato graficamente nel
+triennio 2020-2023 trova qui conferma statistica: considerando
+congiuntamente i dodici mesi precedenti, la varianza risulta chiaramente
+prevedibile.
+
+**Come leggere questa asimmetria.** Il test a 12 ritardi non afferma che
+il mese *t−12* influenzi il mese *t*: verifica congiuntamente i dodici
+coefficienti, quindi rileva che *l’insieme* dell’ultimo anno di
+turbolenza spiega la varianza corrente. L’eteroschedasticità di questa
+serie non è una persistenza mese su mese, ma un **regime prolungato di
+alta volatilità** — un periodo in cui il livello generale di incertezza
+resta elevato per molti mesi consecutivi, invece di trasmettersi da un
+mese al successivo.
+
+Una cautela da tenere presente: un test ARCH-LM con molti ritardi può
+essere sensibile alla presenza di pochi outlier estremi raggruppati nel
+tempo, che è esattamente la situazione del 2021-2022. Il risultato resta
+valido, ma la sua interpretazione più prudente è “esiste un regime di
+alta varianza identificabile” piuttosto che “esiste una struttura GARCH
+stabile e stimabile su tutto il campione”.
+
+### Implicazioni per la modellazione
+
+Gli effetti ARCH certificano che la varianza del benchmark non è
+costante. In teoria questo aprirebbe alla stima di un modello ibrido
+ARIMA-GARCH. Si decide tuttavia di mantenere l’**ARIMA puro** come
+benchmark definitivo, per due ragioni:
+
+**Neutralità sulla stima puntuale.** La metrica che deciderà se l’ECM
+batte il benchmark si basa sugli errori di previsione puntuale (RMSE e
+MAE fuori campione). Un termine GARCH modella la varianza degli errori e
+lascia sostanzialmente inalterati i coefficienti dell’equazione della
+media: renderebbe il modello più complesso senza migliorare la
+previsione del livello. Ne beneficerebbero gli **intervalli** di
+previsione, che però non sono la metrica di confronto.
+
+**Trasparenza del confronto.** L’obiettivo della tesi è misurare il
+contributo informativo di inflazione europea e prezzo del petrolio.
+Mantenere l’ARIMA puro assicura un termine di paragone lineare e
+leggibile, che isola il puro effetto “memoria storica” del processo
+inflattivo italiano.
+
+L’estensione GARCH resta quindi una possibile direzione di sviluppo da
+discutere nel capitolo conclusivo, non un passaggio necessario di questo
+lavoro.
+
+``` r
+# Chunk: salvataggio
+# Salviamo il benchmark completo (ENTRAMBI i modelli), il nome del vincitore
+# in-sample e la tabella dei criteri. Nel notebook 06 verranno confrontati
+# entrambi i modelli ARIMA contro l'ECM: l'oggetto fit_benchmark li contiene
+# gia' tutti e due, quindi non serve altro.
+saveRDS(fit_benchmark,     here("Data", "Processed", "fit_benchmark.rds"))
+saveRDS(confronto_criteri, here("Data", "Processed", "confronto_criteri_benchmark.rds"))
+saveRDS(modello_migliore,  here("Data", "Processed", "modello_migliore_benchmark.rds"))
+```
+
+# Sintesi delle decisioni
+
+| Decisione                                                     | Motivazione                                                                                                                                         |
+|---------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------|
+| d = 1, D = 0 fissati a priori                                 | Risultato dei test di radice unitaria del notebook 02; lo spike al lag 12 è autocorrelazione residua isolata, non stagionalità integrata            |
+| Due modelli: ricerca automatica e controllo manuale           | Il secondo verifica se il guadagno di fit del primo è sostanziale e intercetta le radici quasi cancellate                                           |
+| `fable::ARIMA()` con namespace esplicito                      | `FinTS` maschera `ARIMA()`: senza il prefisso verrebbe chiamata la funzione sbagliata                                                               |
+| Selezione via AICc, non AIC                                   | Criterio corretto per campioni non enormi                                                                                                           |
+| Selezione del vincitore via codice                            | Riproducibilità: la scelta si aggiorna da sola se i dati cambiano                                                                                   |
+| **Entrambi i modelli portati al confronto out-of-sample**     | `arima_auto` vince in-sample ma ha radici quasi cancellate, un fattore di rischio fuori campione: decide il test set                                |
+| Ljung-Box su entrambi i modelli, non solo sul vincitore       | Il confronto ha smentito l’ipotesi di sovra-parametrizzazione di `arima_auto` e rivelato che il modello di controllo è mis-specificato (p = 0.0024) |
+| `arima_parsimonioso` portato avanti pur fallendo il Ljung-Box | Resta un termine di paragone deliberatamente semplice; la mis-specificazione va dichiarata, non nascosta                                            |
+| Benchmark = ARIMA puro, senza estensione GARCH                | Il GARCH modella la varianza, non la media: non migliorerebbe RMSE/MAE, che sono le metriche del confronto                                          |

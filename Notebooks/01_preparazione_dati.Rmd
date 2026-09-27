@@ -1,7 +1,7 @@
 ---
 title: "01 - Preparazione dei Dati"
 subtitle: "Inflazione Italia - Analisi Econometrica"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -24,13 +24,16 @@ library(here)        # here(): percorsi file ancorati alla cartella del progetto
 
 # --- Funzione di lettura per i file BCE -------------------------------------
 # Il formato dell'export BCE e' cambiato con la migrazione dal dataset ICP al
-# dataset HICP: il vecchio file aveva 3 colonne (data, periodo, valore), il
-# nuovo ne ha 2. Invece di codificare un numero fisso di colonne - che si rompe
-# a ogni cambio di formato - questa funzione le riconosce:
+# dataset HICP: variano sia il numero di colonne sia il nome dell'ultima, che
+# incorpora il codice completo della serie ed e' quindi diverso a ogni download.
+# Invece di codificare nomi e posizioni fisse - che si rompono a ogni cambio di
+# formato o di serie - questa funzione identifica le colonne per posizione
+# relativa:
 #   - PRIMA colonna  = periodo temporale
 #   - ULTIMA colonna = valore osservato
 # e capisce da sola se le date sono scritte come "1997-01-31" oppure "1997Jan".
-# Funziona quindi sia col formato vecchio sia col nuovo.
+# Il riepilogo stampato sotto mostra le colonne effettivamente trovate, cosi'
+# si vede sempre su quale formato si sta lavorando.
 leggi_hicp_bce <- function(percorso, nome_valore) {
 
   grezzo <- read_csv(percorso, col_types = cols(.default = col_character()))

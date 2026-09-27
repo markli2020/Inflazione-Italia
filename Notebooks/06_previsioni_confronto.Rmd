@@ -1,7 +1,7 @@
 ---
 title: "06 - Previsioni fuori campione e confronto ECM vs Benchmark"
 subtitle: "Inflazione Italia - Analisi Econometrica"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -381,10 +381,11 @@ lungo periodo stimata sul campione 1997–2022:
 
 $$hicp\_it^{eq} \approx 1.3431 \cdot hicp\_ea - 0.2912 \cdot \log(brent) + 0.6248$$
 
-Con i valori tipici del 2024–2025 — inflazione dell'area euro attorno al 2.2–2.4%
-e Brent attorno a 70 EUR — quella formula implica un'inflazione italiana di
-equilibrio intorno al **2.3%**. L'inflazione italiana effettivamente osservata in
-quel periodo è stata invece attorno all'**1%**.
+Con i valori tipici del 2024–2025 — inflazione dell'area euro fra il 2.2% e il
+2.4% e Brent attorno a 70 EUR/barile — quella formula implica un'inflazione
+italiana di equilibrio fra il **2.3% e il 2.6%**. L'inflazione italiana
+effettivamente osservata in quel periodo si è mantenuta invece fra l'**1% e
+l'1.5%**: uno scarto persistente di oltre un punto percentuale.
 
 Il risultato è che l'ECT resta persistentemente negativo, e il meccanismo di
 correzione — con coefficiente negativo — genera mese dopo mese una spinta al
@@ -599,7 +600,7 @@ metriche_anno %>% left_join(vincitori, by = "anno")
 
 | Anno | n | arima_pars | ECM_A5 | ECM_A8 | arima_auto | Naive | Vincitore | Contesto macro |
 |---|---|---|---|---|---|---|---|---|
-| 2023 | 12 | **1.1323** | 1.1408 | 1.2048 | 1.2751 | 1.4457 | arima_pars | disinflazione dal picco (10.7% → 0.5%) |
+| 2023 | 12 | **1.1323** | 1.1408 | 1.2048 | 1.2751 | 1.4457 | arima_pars | disinflazione dal picco (10.7% → 0.6%) |
 | 2024 | 12 | **0.3160** | 0.6846 | 0.7150 | 0.5010 | 0.3686 | arima_pars | inflazione stabile attorno all'1% |
 | 2025 | 12 | 0.2670 | 0.3006 | 0.3022 | 0.3888 | **0.2327** | Naive | inflazione stabile attorno all'1.5% |
 | 2026 | 8 | 0.4628 | 0.3284 | **0.2853** | 0.5513 | 0.5050 | **ECM_A8** | risalita verso il 3% |
@@ -679,15 +680,25 @@ regolarità nota.
 
 1. **Esiste una relazione di cointegrazione** fra inflazione italiana, europea e
    prezzo del petrolio, con trasmissione di lungo periodo amplificata (1.34) e
-   un meccanismo di correzione che riassorbe circa il 24% dello squilibrio al
-   mese (semivita ≈ 2.5 mesi). Il risultato è statisticamente solido, robusto a
-   un cambio di valuta e a una revisione metodologica della serie target, e
-   **resta valido indipendentemente dalla performance previsiva**: descrive una
-   proprietà strutturale dei dati, non una capacità di previsione.
+   un meccanismo di correzione rapido. La velocità di aggiustamento è stimata
+   tre volte nel progetto, con risultati molto vicini fra loro: **22.3%** al
+   mese dalla matrice dei pesi di Johansen (notebook 03, semivita 2.7 mesi),
+   **23.9%** dall'ECM_A5 e **25.8%** dall'ECM_A8 (notebook 05, semivita 2.5 e
+   2.3 mesi). Tre stimatori diversi collocano il riassorbimento fra un quinto e
+   un quarto dello squilibrio al mese. Il risultato è statisticamente solido,
+   robusto a un cambio di valuta e a una revisione metodologica della serie
+   target, e **resta valido indipendentemente dalla performance previsiva**:
+   descrive una proprietà strutturale dei dati, non una capacità di previsione.
 
 2. **La componente stagionale annuale** è una caratteristica strutturale
-   individuata in modo indipendente da tre metodologie diverse: ACF/PACF,
-   benchmark SARIMA e selezione di specificazione ECM.
+   individuata per due vie modellistiche distinte: il benchmark SARIMA del
+   notebook 04 — anticipato dalla lettura dell'ACF/PACF, che però è una lettura
+   della stessa serie e non una prova separata — e la selezione di
+   specificazione ECM del notebook 05, che vi arriva attraverso un criterio
+   completamente diverso. I coefficienti stimati sono `sma1` = −0.2552 e
+   −0.3458 per i due SARIMA e −0.2939 per l'ECM: tre valori in un intervallo
+   ristretto, da impianti modellistici che non condividono né la variabile
+   dipendente né il criterio di selezione.
 
 3. **I criteri informativi non predicono la performance fuori campione.**
    `arima_auto` dominava in-sample di 35.6 punti di AICc e perde fuori campione

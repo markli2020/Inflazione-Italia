@@ -1,0 +1,997 @@
+05 - Modello a Correzione d’Errore (ECM) - Selezione della
+specificazione
+================
+
+# Obiettivo del notebook
+
+Il test di Johansen (notebook 03) ha stabilito che `hicp_it`, `hicp_ea`
+e `log(brent)` sono legate da **una** relazione di cointegrazione (rango
+r = 1). La conseguenza metodologica è precisa: il modello corretto non è
+un SARIMAX sulle sole differenze — che ignorerebbe il legame di lungo
+periodo appena dimostrato — ma un **modello a correzione d’errore
+(ECM)**, che combina due componenti in un’unica equazione:
+
+-   la **dinamica di breve periodo**, espressa nelle differenze
+    (`d_hicp_it`, `d_hicp_ea`, ecc.): come le variabili reagiscono mese
+    per mese;
+-   il **meccanismo di correzione**, espresso dall’Error Correction Term
+    (ECT): quanto l’inflazione italiana rientra verso l’equilibrio di
+    lungo periodo quando se ne allontana.
+
+Lo scopo del notebook non è stimare un solo modello, ma **confrontare in
+modo sistematico una griglia di specificazioni alternative** e scegliere
+quella che soddisfa insieme tre requisiti: buon fit penalizzato
+(AIC/BIC), residui senza autocorrelazione, e un termine di correzione
+d’errore valido.
+
+# Caricamento dei dati
+
+``` r
+# Chunk: caricamento_dati
+# Dataset CORRETTI per questo notebook:
+# - df_train_trans / df_test_trans: serie GIA' differenziate (notebook 02).
+#   Sono la parte di BREVE periodo dell'ECM.
+# - df_train / df_test: serie in LIVELLO. Servono per costruire l'ECT, che
+#   per definizione vive nei livelli, non nelle differenze.
+# - johansen_test: da cui estraiamo il vettore di cointegrazione beta,
+#   stimato SOLO sul train (notebook 03).
+df_train       <- readRDS(here("Data", "Processed", "df_train.rds"))
+df_test        <- readRDS(here("Data", "Processed", "df_test.rds"))
+df_train_trans <- readRDS(here("Data", "Processed", "df_train_trans.rds"))
+df_test_trans  <- readRDS(here("Data", "Processed", "df_test_trans.rds"))
+johansen_test  <- readRDS(here("Data", "Processed", "johansen_test.rds"))
+```
+
+Un ECM è l’unico modello di questo progetto che ha bisogno **sia** dei
+livelli **sia** delle differenze, e non si tratta di una ridondanza:
+
+-   le **differenze** (`df_*_trans`) costituiscono la parte di breve
+    periodo. Sono stazionarie per costruzione (notebook 02), quindi una
+    regressione fatta su di esse non è spuria;
+-   i **livelli** (`df_train`, `df_test`) servono esclusivamente a
+    costruire l’ECT. La deviazione dall’equilibrio di lungo periodo è
+    per definizione una distanza fra i *livelli* delle variabili: non
+    avrebbe senso calcolarla sulle differenze, che quell’informazione
+    l’hanno persa.
+
+# Estrazione del vettore di cointegrazione
+
+``` r
+# Chunk: estrazione_beta
+# Estraiamo la PRIMA colonna degli autovettori: e' la relazione di
+# cointegrazione associata al rango r = 1 individuato nel notebook 03.
+# Con ecdet = "const" il vettore ha 4 componenti, nell'ordine:
+# hicp_it, hicp_ea, log_brent, constant.
+beta_coint <- johansen_test@V[, 1]
+
+print("Vettore di cointegrazione (beta), normalizzato su hicp_it:")
+```
+
+    ## [1] "Vettore di cointegrazione (beta), normalizzato su hicp_it:"
+
+``` r
+print(beta_coint)
+```
+
+    ##   hicp_it.l2   hicp_ea.l2 log_brent.l2     constant 
+    ##    1.0000000   -1.3430836    0.2911738   -0.6248139
+
+**Perché la prima colonna e non un’altra.** L’oggetto `ca.jo`
+restituisce tante colonne quante sono le variabili del sistema, ordinate
+per autovalore decrescente. Il test trace ha stabilito rango 1: solo la
+**prima** relazione è statisticamente valida, le altre sono combinazioni
+numeriche prive di significato economico.
+
+**Il vettore ottenuto**, normalizzato ponendo a 1 il coefficiente
+dell’inflazione italiana:
+
+| Componente  | Valore  |
+|-------------|---------|
+| `hicp_it`   | 1.0000  |
+| `hicp_ea`   | −1.3431 |
+| `log_brent` | +0.2912 |
+| costante    | −0.6248 |
+
+L’equilibrio di lungo periodo è quindi
+
+$$hicp\_it - 1.3431 \cdot hicp\_ea + 0.2912 \cdot \log(brent) - 0.6248 \approx 0$$
+
+ovvero, isolando l’inflazione italiana,
+
+$$hicp\_it \approx 1.3431 \cdot hicp\_ea - 0.2912 \cdot \log(brent) + 0.6248$$
+
+Nel lungo periodo, a un punto in più di inflazione nell’area euro
+corrispondono circa **1.34 punti** in Italia: una reazione amplificata
+rispetto alla media europea. Il coefficiente sul petrolio è negativo, un
+segno che merita cautela interpretativa (vedi notebook 03): va letto
+**al netto** di `hicp_ea`, che già incorpora gli shock energetici comuni
+all’area euro, e non rappresenta quindi un effetto causale diretto del
+prezzo del petrolio sull’inflazione italiana.
+
+# Costruzione dell’Error Correction Term
+
+``` r
+# Chunk: costruzione_ect
+# L'ECT misura la deviazione dall'equilibrio di lungo periodo in ogni istante.
+#
+# NOTA METODOLOGICA: beta e' stimato solo sul train (notebook 03), ma l'ECT
+# va CALCOLATO anche sul test set - altrimenti nel notebook successivo non
+# potremmo produrre previsioni fuori campione. Usare il beta del train sul
+# test NON e' data leakage: stiamo applicando un parametro gia' stimato a
+# dati nuovi, esattamente come si fa con qualsiasi coefficiente in previsione.
+serie_livello <- bind_rows(
+  df_train %>% as_tibble(),
+  df_test  %>% as_tibble()
+) %>%
+  arrange(date) %>%
+  mutate(
+    ECT = hicp_it    * beta_coint[1] +
+          hicp_ea    * beta_coint[2] +
+          log(brent) * beta_coint[3] +
+          beta_coint[4]
+  ) %>%
+  dplyr::select(date, ECT)
+
+# Uniamo l'ECT alle serie differenziate (breve periodo)
+serie_trans <- bind_rows(
+  df_train_trans %>% as_tibble(),
+  df_test_trans  %>% as_tibble()
+) %>%
+  arrange(date) %>%
+  left_join(serie_livello, by = "date")
+```
+
+**Cosa è l’ECT, concretamente.** È il residuo della relazione di
+cointegrazione: mese per mese, misura quanto le tre variabili si
+discostano dalla proporzione di equilibrio. Se in un dato mese l’ECT è
+positivo, l’inflazione italiana è *sopra* il livello che l’equilibrio di
+lungo periodo implicherebbe, date l’inflazione europea e il prezzo del
+petrolio di quel mese.
+
+**La distinzione critica fra stimare e applicare.** Il vettore β è stato
+stimato esclusivamente sul train (fino a dicembre 2022), e questo
+protegge dal data leakage. Calcolare l’ECT anche sulle date del test set
+non introduce contaminazione: si applica un parametro già fissato a dati
+nuovi, esattamente come si fa con qualunque coefficiente di regressione
+quando si produce una previsione. Senza questo passaggio, nel notebook
+successivo mancherebbe il regressore necessario a prevedere fuori
+campione.
+
+``` r
+# Chunk: grafico_ect
+# L'ECT deve oscillare attorno allo zero e rientrare dopo ogni deviazione:
+# e' la conferma visiva che la relazione di cointegrazione "tiene".
+serie_trans %>%
+  dplyr::filter(date <= yearmonth("2022-12")) %>%
+  ggplot(aes(x = as.Date(date), y = ECT)) +
+  geom_line() +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(title = "Error Correction Term (ECT) - train",
+       subtitle = "Deviazione dall'equilibrio di lungo periodo",
+       x = NULL, y = "Deviazione") +
+  theme_minimal()
+```
+
+![](05_ecm_files/figure-gfm/grafico_ect-1.png)<!-- -->
+
+**Come leggerlo.** È il controllo visivo che affianca il test formale di
+Johansen. Una serie che oscilla attorno allo zero e che, dopo ogni
+deviazione, vi ritorna entro un orizzonte ragionevole è il comportamento
+atteso di una relazione di cointegrazione autentica. Una serie che
+derivasse progressivamente in una direzione senza mai rientrare
+segnalerebbe che la relazione non tiene, e metterebbe in discussione il
+risultato del test.
+
+# Costruzione dei regressori ritardati
+
+``` r
+# Chunk: costruzione_regressori
+# Pre-costruiamo TUTTE le colonne ritardate che i vari candidati potrebbero
+# usare. Farlo qui (invece che dentro le formule lm) e' essenziale per il
+# motivo spiegato nel chunk successivo: garantire un campione comune.
+dati_ecm <- serie_trans %>%
+  mutate(
+    ECT_l1          = dplyr::lag(ECT, 1),
+
+    # Inerzia dell'inflazione italiana (breve periodo + stagionale)
+    d_hicp_it_l1    = dplyr::lag(d_hicp_it, 1),
+    d_hicp_it_l2    = dplyr::lag(d_hicp_it, 2),
+    d_hicp_it_l3    = dplyr::lag(d_hicp_it, 3),
+    d_hicp_it_l12   = dplyr::lag(d_hicp_it, 12),
+
+    # Inflazione area euro: contemporanea e ritardata
+    d_hicp_ea_l0    = d_hicp_ea,
+    d_hicp_ea_l1    = dplyr::lag(d_hicp_ea, 1),
+    d_hicp_ea_l2    = dplyr::lag(d_hicp_ea, 2),
+
+    # Petrolio (EUR/barile): contemporaneo e ritardato
+    dlog_brent_l0   = dlog_brent,
+    dlog_brent_l1   = dplyr::lag(dlog_brent, 1),
+
+    # Produzione industriale: contemporanea e ritardata
+    dlog_ind_pro_l0 = dlog_ind_pro,
+    dlog_ind_pro_l1 = dplyr::lag(dlog_ind_pro, 1)
+  )
+
+# Separiamo di nuovo train e test
+dati_ecm_train <- dati_ecm %>% dplyr::filter(date <= yearmonth("2022-12"))
+dati_ecm_test  <- dati_ecm %>% dplyr::filter(date >  yearmonth("2022-12"))
+```
+
+**Perché l’ECT entra ritardato di un periodo (`ECT_l1`).** Non è un
+dettaglio tecnico ma il cuore logico del modello: la correzione avviene
+*in risposta* a uno squilibrio già osservato. L’inflazione di questo
+mese si aggiusta in funzione della deviazione registrata il mese scorso.
+Usare l’ECT contemporaneo creerebbe una simultaneità che renderebbe la
+stima inconsistente — l’ECT del mese corrente contiene `hicp_it` del
+mese corrente, cioè la variabile stessa che si sta cercando di spiegare.
+
+**Perché i ritardi si costruiscono qui e non dentro le formule.** È
+indispensabile per garantire il campione comune spiegato nel chunk
+seguente: scrivendo `lag(d_hicp_it, 12)` direttamente nella formula di
+`lm()`, ogni modello calcolerebbe i propri NA in autonomia e finirebbe
+per girare su un campione diverso dagli altri.
+
+**Perché il ritardo 12.** Viene dalle evidenze dei notebook precedenti:
+l’ACF e la PACF del notebook 04 mostrano uno spike isolato e negativo
+esattamente al ritardo 12, e il benchmark ARIMA stima un coefficiente
+stagionale (`sma1 = −0.2552`) chiaramente significativo. L’ECM deve
+poter catturare la stessa struttura, altrimenti se la ritroverebbe nei
+residui come autocorrelazione.
+
+# Il campione comune di stima
+
+``` r
+# Chunk: campione_comune
+# CRITICO: AIC e BIC sono confrontabili SOLO tra modelli stimati sullo stesso
+# numero di osservazioni. Se lasciassimo che ogni lm() scarti autonomamente le
+# righe con NA, il modello con lag 12 perderebbe 12 osservazioni in piu' degli
+# altri, e i suoi AIC/BIC risulterebbero artificialmente migliori (meno dati =
+# log-verosimiglianza piu' alta). Il confronto sarebbe falsato a favore dei
+# modelli con piu' ritardi.
+#
+# Soluzione: fissiamo un campione comune, eliminando le righe con NA su
+# QUALSIASI regressore candidato. Tutti i modelli vengono stimati su queste
+# stesse righe.
+regressori_tutti <- c(
+  "ECT_l1",
+  "d_hicp_it_l1", "d_hicp_it_l2", "d_hicp_it_l3", "d_hicp_it_l12",
+  "d_hicp_ea_l0", "d_hicp_ea_l1", "d_hicp_ea_l2",
+  "dlog_brent_l0", "dlog_brent_l1",
+  "dlog_ind_pro_l0", "dlog_ind_pro_l1"
+)
+
+dati_stima <- dati_ecm_train %>%
+  tidyr::drop_na(all_of(c("d_hicp_it", regressori_tutti)))
+
+cat("Campione comune di stima:", nrow(dati_stima), "osservazioni |",
+    as.character(min(dati_stima$date)), "->", as.character(max(dati_stima$date)), "\n")
+```
+
+    ## Campione comune di stima: 299 osservazioni | 1998 feb -> 2022 dic
+
+**Il problema dei valori mancanti.** Ogni variabile ritardata genera per
+costruzione valori mancanti all’inizio della serie: `d_hicp_it_l1` ne ha
+1, `d_hicp_it_l12` ne ha 12. Non è un errore nei dati — il ritardo a 12
+mesi di febbraio 1997 richiederebbe un dato di febbraio 1996, fuori dal
+campione.
+
+Il rischio è che questo falsi il confronto fra modelli. AIC e BIC sono
+funzioni della log-verosimiglianza, che dipende dal numero di
+osservazioni: **un modello stimato su meno dati tende ad avere AIC e BIC
+più bassi** a parità di qualità del fit. Se ogni `lm()` scartasse i
+propri NA in autonomia, le specificazioni con il ritardo 12 girerebbero
+su 12 osservazioni in meno e otterrebbero un vantaggio artificiale — si
+finirebbe per selezionare i modelli più complessi per una ragione
+contabile, non econometrica.
+
+**Verifica sui numeri.** `df_train_trans` parte da febbraio 1997 e
+arriva a dicembre 2022: 311 osservazioni. Il campione comune risulta di
+**299 osservazioni, da febbraio 1998 a dicembre 2022** — esattamente 311
+− 12. La perdita è interamente attribuibile al ritardo di 12 mesi ed è
+la minima possibile data la presenza di quel regressore.
+
+# Definizione della griglia di candidati
+
+``` r
+# Chunk: definizione_candidati
+# Griglia di specificazioni da confrontare.
+#
+# DUE FAMIGLIE, da non mescolare nel confronto finale:
+#
+# (A) UNCONDITIONAL - usano solo variabili ritardate. Sono le uniche
+#     specificazioni utilizzabili per una previsione genuina: al tempo t si
+#     conosce solo cio' che e' accaduto fino a t-1.
+#
+# (B) CONDITIONAL - includono regressori CONTEMPORANEI (d_hicp_ea_l0 ecc.).
+#     Per prevedere hicp_it di un certo mese assumono di conoscere gia'
+#     l'inflazione europea dello stesso mese. Sui dati storici "funziona"
+#     (il valore vero e' nel dataset), ma in previsione reale quel dato non
+#     sarebbe disponibile. Confrontarle con l'ARIMA benchmark del notebook 04
+#     (che usa solo la propria storia) darebbe un vantaggio informativo
+#     scorretto e un RMSE gonfiato a favore dell'ECM.
+#     Vanno quindi etichettate esplicitamente come "previsione condizionata".
+candidati <- list(
+
+  # --- FAMIGLIA A: unconditional (solo ritardi) ---
+  A1_minimo          = c("ECT_l1"),
+  A2_inerzia1        = c("ECT_l1", "d_hicp_it_l1"),
+  A3_inerzia1_ea1    = c("ECT_l1", "d_hicp_it_l1", "d_hicp_ea_l1"),
+  A4_inerzia12_ea1   = c("ECT_l1", "d_hicp_it_l1", "d_hicp_it_l2", "d_hicp_ea_l1"),
+  A5_stagionale      = c("ECT_l1", "d_hicp_it_l1", "d_hicp_ea_l1", "d_hicp_it_l12"),
+  A6_stagionale_l2   = c("ECT_l1", "d_hicp_it_l1", "d_hicp_it_l2", "d_hicp_ea_l1",
+                         "d_hicp_it_l12"),
+  A7_stagionale_l3   = c("ECT_l1", "d_hicp_it_l1", "d_hicp_it_l2", "d_hicp_it_l3",
+                         "d_hicp_ea_l1", "d_hicp_it_l12"),
+  A8_con_brent       = c("ECT_l1", "d_hicp_it_l1", "d_hicp_it_l2", "d_hicp_ea_l1",
+                         "d_hicp_it_l12", "dlog_brent_l1"),
+  A9_completo        = c("ECT_l1", "d_hicp_it_l1", "d_hicp_it_l2", "d_hicp_ea_l1",
+                         "d_hicp_ea_l2", "d_hicp_it_l12", "dlog_brent_l1",
+                         "dlog_ind_pro_l1"),
+
+  # --- FAMIGLIA B: conditional (includono contemporanei) ---
+  B1_ea_contemp      = c("ECT_l1", "d_hicp_ea_l0", "d_hicp_it_l1", "d_hicp_ea_l1"),
+  B2_ea_contemp_stag = c("ECT_l1", "d_hicp_ea_l0", "d_hicp_it_l1", "d_hicp_ea_l1",
+                         "d_hicp_it_l12"),
+  B3_completo        = c("ECT_l1", "d_hicp_ea_l0", "dlog_brent_l0", "dlog_ind_pro_l0",
+                         "d_hicp_it_l1", "d_hicp_ea_l1", "dlog_brent_l1",
+                         "dlog_ind_pro_l1", "d_hicp_it_l12")
+)
+```
+
+**La logica della griglia.** I candidati della famiglia A sono costruiti
+in ordine crescente di complessità, partendo dal modello minimo (solo il
+meccanismo di correzione) e aggiungendo progressivamente inerzia di
+breve periodo, trasmissione dall’area euro, componente stagionale, shock
+energetici e ciclo reale. Questo permette di vedere quale aggiunta porta
+un miglioramento reale e quale è solo complessità inutile.
+
+**La distinzione fra famiglia A e B è metodologica, non tecnica.** I
+modelli della famiglia B includono regressori contemporanei: per
+prevedere l’inflazione italiana di un certo mese assumono di conoscere
+già l’inflazione europea *dello stesso mese*. Sui dati storici questo
+funziona perché il valore vero è nel dataset, ma corrisponde a
+un’informazione che in una previsione reale non sarebbe disponibile.
+Confrontare un modello simile con l’ARIMA benchmark, che usa
+esclusivamente la propria storia passata, darebbe all’ECM un vantaggio
+informativo scorretto e un RMSE artificialmente basso. In letteratura la
+distinzione ha un nome preciso — previsione *unconditional* contro
+*conditional* — e va dichiarata esplicitamente. I modelli B vengono
+stimati perché restano informativi sulle relazioni contemporanee, ma il
+confronto predittivo userà solo la famiglia A.
+
+# Stima della griglia e raccolta delle metriche
+
+``` r
+# Chunk: stima_griglia
+# Stimiamo ogni candidato sullo STESSO campione e raccogliamo le metriche.
+#
+# Metriche raccolte:
+# - AIC / BIC: fit penalizzato per complessita' (confrontabili: stesso campione)
+# - bg_p_12: p-value Breusch-Godfrey ordine 12. H0 = nessuna autocorrelazione.
+#            Vogliamo p-value ALTO (> 0.05): significa residui puliti.
+# - arch_p_12: p-value ARCH-LM. H0 = nessun effetto ARCH.
+# - ect_coef / ect_p: coefficiente e p-value dell'ECT ritardato. CONDIZIONE DI
+#            VALIDITA' DELL'ECM: deve essere NEGATIVO e significativo. Se fosse
+#            positivo o nullo il sistema non tornerebbe all'equilibrio, e il
+#            modello non sarebbe un vero ECM.
+stima_candidato <- function(nome, regressori, dati) {
+
+  formula_mod <- reformulate(regressori, response = "d_hicp_it")
+  mod <- lm(formula_mod, data = dati)
+
+  res   <- residuals(mod)
+  coefs <- summary(mod)$coefficients
+
+  bg   <- bgtest(mod, order = 12)
+  arch <- FinTS::ArchTest(res, lags = 12)
+
+  tibble(
+    modello      = nome,
+    famiglia     = ifelse(str_starts(nome, "A"), "A_unconditional", "B_conditional"),
+    n_regressori = length(regressori),
+    n_oss        = nobs(mod),
+    AIC          = round(AIC(mod), 2),
+    BIC          = round(BIC(mod), 2),
+    adj_R2       = round(summary(mod)$adj.r.squared, 4),
+    ect_coef     = round(coefs["ECT_l1", "Estimate"], 4),
+    ect_p        = round(coefs["ECT_l1", "Pr(>|t|)"], 4),
+    bg_p_12      = round(as.numeric(bg$p.value), 4),
+    arch_p_12    = round(as.numeric(arch$p.value), 4)
+  )
+}
+
+risultati_griglia <- imap(candidati, ~ stima_candidato(.y, .x, dati_stima)) %>%
+  list_rbind()
+
+risultati_griglia %>% arrange(famiglia, AIC)
+```
+
+    ## # A tibble: 12 × 11
+    ##    modello famiglia n_regressori n_oss   AIC   BIC adj_R2 ect_coef ect_p bg_p_12
+    ##    <chr>   <chr>           <int> <int> <dbl> <dbl>  <dbl>    <dbl> <dbl>   <dbl>
+    ##  1 A8_con… A_uncon…            6   299 192.   221.  0.294   -0.258     0  0.142 
+    ##  2 A5_sta… A_uncon…            4   299 192.   215.  0.288   -0.239     0  0.106 
+    ##  3 A6_sta… A_uncon…            5   299 193.   219.  0.288   -0.247     0  0.135 
+    ##  4 A9_com… A_uncon…            8   299 195.   232.  0.292   -0.252     0  0.146 
+    ##  5 A7_sta… A_uncon…            6   299 195.   224.  0.287   -0.242     0  0.114 
+    ##  6 A4_ine… A_uncon…            4   299 213.   235.  0.238   -0.224     0  0.0009
+    ##  7 A3_ine… A_uncon…            3   299 213.   231.  0.234   -0.213     0  0.0004
+    ##  8 A1_min… A_uncon…            1   299 225.   236.  0.198   -0.264     0  0.0003
+    ##  9 A2_ine… A_uncon…            2   299 227.   241.  0.196   -0.266     0  0     
+    ## 10 B2_ea_… B_condi…            5   299  83.6  110.  0.506   -0.195     0  0.0165
+    ## 11 B3_com… B_condi…            9   299  87.9  129.  0.506   -0.184     0  0.0142
+    ## 12 B1_ea_… B_condi…            4   299  94.5  117.  0.486   -0.177     0  0.0001
+    ## # ℹ 1 more variable: arch_p_12 <dbl>
+
+**Come leggere questa tabella.** Le colonne non hanno tutte lo stesso
+peso decisionale, e l’ordine di lettura conta:
+
+-   **`ect_coef` e `ect_p` vengono prima di tutto.** Il coefficiente
+    dell’ECT deve essere **negativo e significativo**: è la condizione
+    di validità stessa del modello. Negativo significa che, quando
+    l’inflazione si trova sopra l’equilibrio, il mese successivo scende.
+    Un coefficiente positivo indicherebbe un sistema esplosivo, uno non
+    significativo che il meccanismo di correzione non opera: in entrambi
+    i casi non sarebbe un vero ECM, per quanto buono fosse l’AIC.
+-   **`bg_p_12`**: p-value del Breusch-Godfrey fino all’ordine 12.
+    L’ipotesi nulla è *assenza* di autocorrelazione, quindi si vuole un
+    p-value **alto** (> 0.05). Autocorrelazione residua significa che
+    nei residui è rimasta struttura prevedibile: un segnale che manca un
+    ritardo rilevante.
+-   **`AIC` / `BIC`**: bontà del fit penalizzata per complessità. Il BIC
+    penalizza più severamente, quindi tende a preferire modelli più
+    parsimoniosi; quando i due criteri concordano la scelta è robusta,
+    quando divergono va arbitrata.
+-   **`adj_R2`**: quota di varianza spiegata. In una regressione su
+    serie differenziate valori attorno a 0.2–0.3 sono del tutto normali:
+    non è un modello debole, è la natura dei dati in differenza.
+-   **`arch_p_12`**: eteroschedasticità condizionata. Non è un criterio
+    di selezione, ma determina quale tipo di errori standard usare per
+    l’inferenza.
+
+## I risultati della griglia
+
+Tutti e dodici i candidati sono stimati sulle stesse 299 osservazioni,
+quindi i criteri informativi sono pienamente confrontabili.
+
+**Famiglia A (unconditional)**
+
+| Modello          | n. reg. | AIC        | BIC        | adj R² | ECT     | BG p   |
+|------------------|---------|------------|------------|--------|---------|--------|
+| A8_con_brent     | 6       | **191.64** | 221.24     | 0.2941 | −0.2579 | 0.1417 |
+| A5_stagionale    | 4       | 192.40     | **214.61** | 0.2876 | −0.2391 | 0.1057 |
+| A6_stagionale_l2 | 5       | 193.05     | 218.95     | 0.2884 | −0.2466 | 0.1352 |
+| A9_completo      | 8       | 194.59     | 231.60     | 0.2917 | −0.2525 | 0.1457 |
+| A7_stagionale_l3 | 6       | 194.79     | 224.39     | 0.2866 | −0.2420 | 0.1144 |
+| A4_inerzia12_ea1 | 4       | 212.52     | 234.72     | 0.2380 | −0.2244 | 0.0009 |
+| A3_inerzia1_ea1  | 3       | 212.97     | 231.47     | 0.2344 | −0.2132 | 0.0004 |
+| A1_minimo        | 1       | 224.73     | 235.83     | 0.1984 | −0.2643 | 0.0003 |
+| A2_inerzia1      | 2       | 226.66     | 241.46     | 0.1958 | −0.2661 | 0.0000 |
+
+**Famiglia B (conditional)**
+
+| Modello            | n. reg. | AIC   | BIC    | adj R² | ECT     | BG p   |
+|--------------------|---------|-------|--------|--------|---------|--------|
+| B2_ea_contemp_stag | 5       | 83.63 | 109.53 | 0.5065 | −0.1954 | 0.0165 |
+| B3_completo        | 9       | 87.93 | 128.63 | 0.5058 | −0.1844 | 0.0142 |
+| B1_ea_contemp      | 4       | 94.53 | 116.73 | 0.4865 | −0.1770 | 0.0001 |
+
+### Il risultato più netto: è il ritardo 12 a fare la differenza
+
+La famiglia A si divide in due blocchi separati da un solo criterio: la
+presenza o meno di `d_hicp_it_l12`.
+
+-   I **cinque modelli che contengono il ritardo stagionale** (A5, A6,
+    A7, A8, A9) superano *tutti* il Breusch-Godfrey, con p-value fra
+    0.106 e 0.146.
+-   I **quattro che non lo contengono** (A1, A2, A3, A4) lo falliscono
+    *tutti*, e in modo schiacciante: p-value fra 0.0000 e 0.0009.
+
+Non è una differenza di grado ma di natura. Nessuna combinazione di
+ritardi brevi riesce a ripulire i residui: la struttura residua nei
+modelli A1–A4 è specificamente **annuale**, e solo un termine a 12 mesi
+può assorbirla. Lo stacco si vede anche nei criteri informativi — fra il
+peggiore dei modelli con stagionalità (A7, AIC 194.79) e il migliore
+senza (A4, AIC 212.52) corrono quasi 18 punti di AIC.
+
+Questo chiude il cerchio con i notebook precedenti: l’ACF/PACF del
+notebook 04 mostrava uno spike isolato e negativo al ritardo 12, i
+benchmark ARIMA dello stesso notebook stimano un coefficiente stagionale
+significativo (`sma1` pari a −0.2552 nel modello parsimonioso e −0.3458
+in quello automatico), e qui la selezione di specificazione arriva alla
+stessa conclusione per una via completamente diversa.
+
+Vale la pena essere precisi sul grado di indipendenza fra queste
+evidenze. Il correlogramma e il modello SARIMA sono due letture della
+stessa serie, quindi non sono prove indipendenti in senso statistico: la
+seconda formalizza ciò che la prima suggerisce. La **griglia ECM è
+invece una verifica genuinamente separata**, perché arriva alla
+componente annuale attraverso un criterio diverso — quali specificazioni
+riescono a ripulire i residui in un modello multivariato con termine di
+correzione d’errore — e su una variabile dipendente in differenze
+anziché in livelli. Che due impianti modellistici così diversi
+convergano sulla stessa struttura è l’argomento da portare in tesi.
+
+### La selezione: A8 vince, ma con una tensione da dichiarare
+
+La regola fissata in anticipo — miglior AIC fra i candidati validi —
+seleziona **A8_con_brent** (AIC 191.64). Ma il quadro va riportato per
+intero, perché i due criteri informativi non concordano:
+
+|            | A8_con_brent | A5_stagionale | Differenza          |
+|------------|--------------|---------------|---------------------|
+| Regressori | 6            | 4             |                     |
+| AIC        | **191.64**   | 192.40        | 0.76 a favore di A8 |
+| BIC        | 221.24       | **214.61**    | 6.63 a favore di A5 |
+| adj R²     | 0.2941       | 0.2876        | +0.0065 per A8      |
+| BG p-value | 0.1417       | 0.1057        | entrambi puliti     |
+
+**Il vantaggio di A8 sull’AIC è di 0.76 punti**, cioè al di sotto della
+soglia convenzionale di 2 (Burnham & Anderson) entro la quale due
+modelli si considerano empiricamente equivalenti. L’AIC, da solo, non
+separa i due modelli. Il **BIC invece li separa nettamente**, di 6.63
+punti, a favore del più parsimonioso: A8 aggiunge due regressori e il
+BIC giudica che non li giustifichino.
+
+Questo è un cambiamento rispetto all’analisi condotta sulla versione
+precedente dei dati, dove A5 vinceva su entrambi i criteri. Con la serie
+HICP aggiornata il coefficiente sul petrolio ritardato guadagna forza e
+sposta l’AIC a favore di A8. La conclusione metodologicamente corretta
+non è “A8 è il modello migliore”, ma: **i due modelli sono
+statisticamente indistinguibili in-sample, con l’AIC marginalmente a
+favore del più ricco e il BIC decisamente a favore del più
+parsimonioso**.
+
+Dato che la metrica decisiva di questo progetto è la performance **fuori
+campione**, la scelta più onesta è portare **entrambi** al confronto del
+notebook 06 e lasciare che sia il test set a decidere. Non si tratta di
+cherry-picking: entrambi i modelli superano tutti i requisiti dichiarati
+in anticipo, e riportare le prestazioni predittive di due specificazioni
+equivalenti è più informativo che sceglierne una per 0.76 punti di AIC.
+
+### Il petrolio nel breve periodo: un risultato che si è ribaltato
+
+`dlog_brent_l1` è ciò che distingue A8 da A6, e con i dati aggiornati
+porta un contributo reale (AIC da 193.05 a 191.64). Il coefficiente
+stimato è **+0.3711**, con p-value 0.068 al limite della significatività
+convenzionale.
+
+Il dato interessante è il **segno positivo**, che è quello
+economicamente atteso: un aumento del prezzo del petrolio nel mese
+precedente spinge al rialzo l’inflazione italiana del mese corrente, il
+classico canale di trasmissione costi-energia.
+
+Questo si combina con quanto osservato nel notebook 03, dove il
+coefficiente di lungo periodo su `log(brent)` risultava **negativo**. I
+due risultati non sono in contraddizione ma descrivono orizzonti
+diversi: nel **breve periodo** il petrolio spinge l’inflazione verso
+l’alto attraverso i costi; nella relazione di **lungo periodo**, letta
+al netto di `hicp_ea` che già incorpora gli shock energetici comuni
+all’area euro, il coefficiente residuo perde l’interpretazione causale
+diretta. È esattamente lo scenario anticipato nel notebook 03, e vale la
+pena presentarlo in tesi come lettura congiunta dei due orizzonti.
+
+### Il ritardo 1 da solo non serve
+
+Confrontando A1_minimo (solo ECT, AIC 224.73) con A2_inerzia1 (ECT +
+`d_hicp_it_l1`, AIC 226.66): aggiungere il primo ritardo **peggiora**
+l’AIC, e l’R² aggiustato addirittura scende (0.1984 → 0.1958). Eppure
+negli altri modelli lo stesso regressore contribuisce. La lettura: la
+dinamica di breve periodo diventa identificabile solo dopo aver rimosso
+la componente annuale che altrimenti maschera il segnale.
+
+### La famiglia B, e perché la separazione era necessaria
+
+I modelli conditional hanno un AIC fra 84 e 95, contro i \~192 del
+miglior unconditional: un vantaggio di circa **108 punti**. L’R²
+aggiustato quasi raddoppia (0.51 contro 0.29). Conoscere l’inflazione
+europea *dello stesso mese* è, prevedibilmente, enormemente informativo.
+
+Ed è esattamente per questo che la separazione fra le due famiglie non
+era un formalismo. Con un’unica classifica avremmo selezionato un
+modello B, e poi, confrontandolo sul test set con un ARIMA che usa solo
+la propria storia passata, avremmo ottenuto una vittoria schiacciante ma
+**priva di significato**: non staremmo dimostrando che l’ECM prevede
+meglio, ma che chi conosce il presente dell’area euro ha un vantaggio su
+chi non lo conosce.
+
+Due dettagli tecnici degni di nota. Primo: **tutti e tre i modelli B
+falliscono il Breusch-Godfrey** (p fra 0.0001 e 0.0165), nonostante il
+fit molto migliore — fit superiore e residui puliti non vanno di pari
+passo. Secondo: il coefficiente dell’ECT è sistematicamente **più
+piccolo in valore assoluto** (−0.18/−0.20 contro −0.24/−0.26), perché
+parte del riassorbimento dello squilibrio viene catturata dal termine
+contemporaneo invece che dal meccanismo di correzione. Anche per
+l’interpretazione strutturale, quindi, la famiglia A racconta il
+meccanismo in modo più pulito.
+
+### Eteroschedasticità: universale, non discriminante
+
+La colonna `arch_p_12` è sostanzialmente **zero per tutti e dodici i
+modelli**. Nessuna specificazione, per quanto ricca, elimina
+l’eteroschedasticità condizionata: è una caratteristica strutturale dei
+dati (la turbolenza 2020–2023), non un sintomo di cattiva
+specificazione. Per questo non è un criterio di selezione — non
+distingue un modello dall’altro — ma impone di usare errori standard
+robusti per l’inferenza.
+
+# Classifica della famiglia unconditional
+
+``` r
+# Chunk: classifica_unconditional
+# Focus sulla famiglia A (le uniche valide per un confronto equo con il
+# benchmark ARIMA). Ordiniamo per AIC e segnaliamo quali superano i due
+# requisiti chiave: residui non autocorrelati (bg_p_12 > 0.05) e ECT
+# negativo e significativo.
+risultati_griglia %>%
+  dplyr::filter(famiglia == "A_unconditional") %>%
+  mutate(
+    residui_puliti = bg_p_12 > 0.05,
+    ect_valido     = ect_coef < 0 & ect_p < 0.05
+  ) %>%
+  arrange(AIC) %>%
+  dplyr::select(modello, AIC, BIC, adj_R2, ect_coef, ect_p, ect_valido,
+                bg_p_12, residui_puliti, arch_p_12)
+```
+
+    ## # A tibble: 9 × 10
+    ##   modello      AIC   BIC adj_R2 ect_coef ect_p ect_valido bg_p_12 residui_puliti
+    ##   <chr>      <dbl> <dbl>  <dbl>    <dbl> <dbl> <lgl>        <dbl> <lgl>         
+    ## 1 A8_con_br…  192.  221.  0.294   -0.258     0 TRUE        0.142  TRUE          
+    ## 2 A5_stagio…  192.  215.  0.288   -0.239     0 TRUE        0.106  TRUE          
+    ## 3 A6_stagio…  193.  219.  0.288   -0.247     0 TRUE        0.135  TRUE          
+    ## 4 A9_comple…  195.  232.  0.292   -0.252     0 TRUE        0.146  TRUE          
+    ## 5 A7_stagio…  195.  224.  0.287   -0.242     0 TRUE        0.114  TRUE          
+    ## 6 A4_inerzi…  213.  235.  0.238   -0.224     0 TRUE        0.0009 FALSE         
+    ## 7 A3_inerzi…  213.  231.  0.234   -0.213     0 TRUE        0.0004 FALSE         
+    ## 8 A1_minimo   225.  236.  0.198   -0.264     0 TRUE        0.0003 FALSE         
+    ## 9 A2_inerzi…  227.  241.  0.196   -0.266     0 TRUE        0      FALSE         
+    ## # ℹ 1 more variable: arch_p_12 <dbl>
+
+Questa tabella traduce i due requisiti in colonne booleane esplicite
+(`ect_valido`, `residui_puliti`), così la selezione non si basa sulla
+lettura a occhio di più p-value ma su criteri dichiarati in anticipo.
+
+**Esito.** `ect_valido` risulta **TRUE per tutti e nove** i candidati:
+il coefficiente dell’ECT è negativo e significativo (p arrotondato a 0)
+in ogni specificazione, e resta notevolmente stabile — sempre fra
+**−0.21 e −0.27** — indipendentemente da quali regressori di breve
+periodo si aggiungano.
+
+Questa **insensibilità del coefficiente alla specificazione** è di per
+sé un risultato: indica che il meccanismo di correzione d’errore è una
+caratteristica robusta dei dati, non un artefatto di una particolare
+scelta di ritardi. È esattamente ciò che ci si aspetta da una relazione
+di cointegrazione autentica, ed è un argomento da usare in tesi.
+
+Il filtro operativo è quindi interamente `residui_puliti`: cinque
+candidati su nove lo superano (A5, A6, A7, A8, A9), e sono precisamente
+quelli che contengono il ritardo stagionale.
+
+**Un miglioramento rispetto all’analisi precedente.** Con la versione
+precedente dei dati i cinque modelli validi avevano p-value del
+Breusch-Godfrey fra 0.055 e 0.079: superavano il test al 5% ma lo
+avrebbero fallito al 10%, e questa marginalità andava dichiarata come
+limite. Con la serie HICP aggiornata i p-value salgono a
+**0.106–0.146**: i residui sono puliti con margine confortevole e quella
+riserva non è più necessaria.
+
+# Selezione e dettaglio del modello migliore
+
+``` r
+# Chunk: dettaglio_migliore_provvisorio
+# Report dettagliato del candidato di famiglia A con AIC piu' basso TRA
+# QUELLI che soddisfano entrambi i requisiti (residui puliti + ECT valido).
+# Se nessuno li soddisfa, ripiega sul miglior AIC e lo segnala.
+candidati_validi <- risultati_griglia %>%
+  dplyr::filter(famiglia == "A_unconditional",
+                bg_p_12 > 0.05,
+                ect_coef < 0, ect_p < 0.05)
+
+if (nrow(candidati_validi) > 0) {
+  nome_migliore <- candidati_validi %>% slice_min(AIC, n = 1) %>% pull(modello)
+  cat("Miglior candidato che soddisfa TUTTI i requisiti:", nome_migliore, "\n\n")
+} else {
+  nome_migliore <- risultati_griglia %>%
+    dplyr::filter(famiglia == "A_unconditional") %>%
+    slice_min(AIC, n = 1) %>% pull(modello)
+  cat("ATTENZIONE: nessun candidato soddisfa tutti i requisiti.\n")
+  cat("Mostrato il miglior AIC:", nome_migliore, "\n\n")
+}
+```
+
+    ## Miglior candidato che soddisfa TUTTI i requisiti: A8_con_brent
+
+``` r
+mod_migliore <- lm(reformulate(candidati[[nome_migliore]], response = "d_hicp_it"),
+                   data = dati_stima)
+
+summary(mod_migliore)
+```
+
+    ## 
+    ## Call:
+    ## lm(formula = reformulate(candidati[[nome_migliore]], response = "d_hicp_it"), 
+    ##     data = dati_stima)
+    ## 
+    ## Residuals:
+    ##      Min       1Q   Median       3Q      Max 
+    ## -1.26320 -0.17136  0.00654  0.15499  2.32781 
+    ## 
+    ## Coefficients:
+    ##               Estimate Std. Error t value Pr(>|t|)    
+    ## (Intercept)    0.00917    0.01928   0.476   0.6346    
+    ## ECT_l1        -0.25790    0.03371  -7.650 2.94e-13 ***
+    ## d_hicp_it_l1  -0.09669    0.06280  -1.540   0.1247    
+    ## d_hicp_it_l2  -0.06457    0.05058  -1.277   0.2027    
+    ## d_hicp_ea_l1   0.20812    0.09794   2.125   0.0344 *  
+    ## d_hicp_it_l12 -0.29388    0.06088  -4.828 2.23e-06 ***
+    ## dlog_brent_l1  0.37112    0.20279   1.830   0.0683 .  
+    ## ---
+    ## Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+    ## 
+    ## Residual standard error: 0.3284 on 292 degrees of freedom
+    ## Multiple R-squared:  0.3083, Adjusted R-squared:  0.2941 
+    ## F-statistic: 21.69 on 6 and 292 DF,  p-value: < 2.2e-16
+
+## Il modello selezionato: A8_con_brent
+
+$$\Delta hicp\_it_t = c + \gamma ECT_{t-1} + \phi_1 \Delta hicp\_it_{t-1} + \phi_2 \Delta hicp\_it_{t-2} + \psi_1 \Delta hicp\_ea_{t-1} + \phi_{12} \Delta hicp\_it_{t-12} + \beta_1 \Delta\log(brent)_{t-1} + \varepsilon_t$$
+
+Sei regressori, tutti ritardati — quindi pienamente utilizzabile per
+previsioni genuine. Stimato su 299 osservazioni, R² aggiustato 0.2941,
+errore standard residuo 0.3284.
+
+### Interpretazione dei coefficienti
+
+| Coefficiente    | Stima       | t OLS  | p OLS     |
+|-----------------|-------------|--------|-----------|
+| `ECT_l1`        | **−0.2579** | −7.650 | 2.9·10⁻¹³ |
+| `d_hicp_it_l12` | **−0.2939** | −4.828 | 2.2·10⁻⁶  |
+| `d_hicp_ea_l1`  | +0.2081     | 2.125  | 0.034     |
+| `dlog_brent_l1` | +0.3711     | 1.830  | 0.068     |
+| `d_hicp_it_l1`  | −0.0967     | −1.540 | 0.125     |
+| `d_hicp_it_l2`  | −0.0646     | −1.277 | 0.203     |
+| Intercetta      | 0.0092      | 0.476  | 0.635     |
+
+**`ECT_l1` = −0.2579** è il cuore del modello e il coefficiente di gran
+lunga più significativo. È **negativo**, come la teoria richiede: il
+meccanismo di correzione funziona. Si interpreta come velocità di
+aggiustamento — circa il **26% dello squilibrio viene riassorbito ogni
+mese** — da cui la semivita della deviazione:
+
+$$t_{1/2} = \frac{\ln(0.5)}{\ln(1 - 0.2579)} \approx 2.3 \text{ mesi}$$
+
+Dopo uno shock che allontana l’inflazione italiana dal suo equilibrio di
+lungo periodo, metà della deviazione si esaurisce in poco più di due
+mesi. È una velocità economicamente plausibile: né un aggiustamento
+istantaneo, sospetto su dati mensili di prezzi, né una correzione così
+lenta da rendere la relazione di lungo periodo irrilevante.
+
+**`d_hicp_it_l12` = −0.2939** è la componente stagionale, il secondo
+coefficiente più forte. Il confronto con i coefficienti stagionali del
+notebook 04 è notevole: il modello parsimonioso stimava
+`sma1 = −0.2552`, quello automatico `sma1 = −0.3458`, e l’ECM trova
+**−0.2939, esattamente fra i due**. Tre specificazioni di natura diversa
+— un SARIMA a tre parametri, un SARIMA a sei e un modello a correzione
+d’errore multivariato — collocano la stessa componente annuale nello
+stesso intervallo ristretto. Non è una coincidenza numerica: è la firma
+di una struttura reale nei dati, non un artefatto di una particolare
+scelta di modello.
+
+**`d_hicp_ea_l1` = +0.2081** è la trasmissione di breve periodo
+dall’area euro: una variazione dell’inflazione europea si riflette
+sull’Italia con un mese di ritardo, per circa il 21% della sua entità.
+Il segno positivo è quello atteso, e questo canale è distinto dalla
+relazione di lungo periodo già catturata dall’ECT.
+
+**`dlog_brent_l1` = +0.3711** è il canale energetico di breve periodo,
+discusso sopra: segno positivo come atteso, significatività al limite
+(0.068).
+
+**`d_hicp_it_l1` e `d_hicp_it_l2` non sono individualmente
+significativi** (p = 0.125 e 0.203). Entrambi hanno segno negativo,
+coerente con un comportamento di *mean reversion* — un’accelerazione
+dell’inflazione tende a essere parzialmente riassorbita nei mesi
+successivi — ma presi singolarmente non sono distinguibili da zero. È
+un’ulteriore ragione per cui il BIC preferisce il più parsimonioso A5, e
+un punto da riportare nel report.
+
+**L’intercetta non è significativa** (p = 0.635), come atteso: una volta
+rimossi il legame di lungo periodo e le dinamiche di breve periodo, non
+resta alcuna deriva sistematica nella variazione mensile
+dell’inflazione.
+
+# Diagnostica del modello selezionato
+
+``` r
+# Chunk: diagnostica_migliore
+# Diagnostica completa sul candidato selezionato
+cat("--- Breusch-Godfrey (H0: nessuna autocorrelazione) ---\n")
+```
+
+    ## --- Breusch-Godfrey (H0: nessuna autocorrelazione) ---
+
+``` r
+print(bgtest(mod_migliore, order = 12))
+```
+
+    ## 
+    ##  Breusch-Godfrey test for serial correlation of order up to 12
+    ## 
+    ## data:  mod_migliore
+    ## LM test = 17.213, df = 12, p-value = 0.1417
+
+``` r
+cat("\n--- ARCH-LM (H0: nessun effetto ARCH) ---\n")
+```
+
+    ## 
+    ## --- ARCH-LM (H0: nessun effetto ARCH) ---
+
+``` r
+print(FinTS::ArchTest(residuals(mod_migliore), lags = 12))
+```
+
+    ## 
+    ##  ARCH LM-test; Null hypothesis: no ARCH effects
+    ## 
+    ## data:  residuals(mod_migliore)
+    ## Chi-squared = 87.933, df = 12, p-value = 1.239e-13
+
+``` r
+cat("\n--- Errori standard HAC (Newey-West), robusti a autocorrelazione ed eteroschedasticita' ---\n")
+```
+
+    ## 
+    ## --- Errori standard HAC (Newey-West), robusti a autocorrelazione ed eteroschedasticita' ---
+
+``` r
+print(coeftest(mod_migliore, vcov = NeweyWest(mod_migliore, lag = 12, prewhite = FALSE)))
+```
+
+    ## 
+    ## t test of coefficients:
+    ## 
+    ##                 Estimate Std. Error t value  Pr(>|t|)    
+    ## (Intercept)    0.0091698  0.0230719  0.3974   0.69133    
+    ## ECT_l1        -0.2579037  0.0653104 -3.9489 9.847e-05 ***
+    ## d_hicp_it_l1  -0.0966944  0.0527952 -1.8315   0.06804 .  
+    ## d_hicp_it_l2  -0.0645743  0.0553770 -1.1661   0.24453    
+    ## d_hicp_ea_l1   0.2081194  0.1216231  1.7112   0.08811 .  
+    ## d_hicp_it_l12 -0.2938830  0.0682428 -4.3064 2.268e-05 ***
+    ## dlog_brent_l1  0.3711206  0.2139028  1.7350   0.08380 .  
+    ## ---
+    ## Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+### Breusch-Godfrey: autocorrelazione residua
+
+**LM = 17.213, df = 12, p-value = 0.1417.** Il test non rifiuta
+l’ipotesi nulla di assenza di autocorrelazione, e questa volta con
+margine confortevole: il requisito è pienamente soddisfatto, non al
+limite. Il modello ha assorbito la struttura di autocorrelazione lineare
+presente nei dati.
+
+### ARCH-LM: eteroschedasticità condizionata
+
+**Chi-quadro = 87.933, df = 12, p-value = 1.24·10⁻¹³.** L’ipotesi nulla
+di assenza di effetti ARCH è rifiutata in modo schiacciante, confermando
+formalmente ciò che i grafici dei notebook precedenti mostravano: la
+varianza degli errori non è costante nel tempo e si concentra nel
+periodo 2020–2023.
+
+Le implicazioni vanno distinte con cura:
+
+-   le **stime puntuali dei coefficienti restano non distorte**:
+    l’eteroschedasticità non è un problema di correttezza delle stime;
+-   gli **errori standard OLS convenzionali diventano inaffidabili**,
+    quindi i p-value della tabella `summary()` sopra non sono
+    utilizzabili per l’inferenza formale;
+-   gli **intervalli di previsione** sarebbero mal calibrati, mentre le
+    previsioni puntuali restano valide.
+
+### Errori standard HAC (Newey-West)
+
+Lo stimatore di Newey-West produce errori standard robusti sia
+all’autocorrelazione sia all’eteroschedasticità. **I p-value di questa
+tabella sono quelli da riportare in tesi**, non quelli della `summary()`
+OLS.
+
+| Coefficiente    | t OLS | t HAC     | p HAC    | Verdetto                           |
+|-----------------|-------|-----------|----------|------------------------------------|
+| `ECT_l1`        | −7.65 | **−3.95** | 9.8·10⁻⁵ | resta altamente significativo      |
+| `d_hicp_it_l12` | −4.83 | **−4.31** | 2.3·10⁻⁵ | resta altamente significativo      |
+| `d_hicp_ea_l1`  | +2.13 | +1.71     | 0.088    | **perde la significatività al 5%** |
+| `dlog_brent_l1` | +1.83 | +1.74     | 0.084    | resta marginale                    |
+| `d_hicp_it_l1`  | −1.54 | −1.83     | 0.068    | resta marginale                    |
+| `d_hicp_it_l2`  | −1.28 | −1.17     | 0.245    | non significativo                  |
+
+**Due coefficienti reggono la verifica più severa**: l’ECT e il termine
+stagionale, entrambi con p-value dell’ordine di 10⁻⁵. Sono le due
+componenti strutturali del modello — il meccanismo di correzione e la
+stagionalità — ed è un risultato solido.
+
+**Un punto da dichiarare con onestà**: `d_hicp_ea_l1` passa da
+significativo al 5% con gli errori OLS (p = 0.034) a **non
+significativo** con quelli robusti (p = 0.088). Il canale di
+trasmissione di breve periodo dall’area euro è quindi meno solido di
+quanto la regressione standard suggerisse. Questo non intacca il
+risultato principale — la trasmissione di **lungo periodo**, catturata
+dall’ECT e dal coefficiente 1.34 del notebook 03, resta fortissima — ma
+va riportato: è la dinamica mensile a essere fragile, non la relazione
+strutturale.
+
+La perdita di forza statistica dell’ECT (da t = −7.65 a t = −3.95) è
+attesa ed è il prezzo della correzione robusta: è il regressore più
+esposto alla turbolenza del 2021–2022. Anche corretto, resta il
+coefficiente più forte del modello.
+
+``` r
+# Chunk: acf_residui_migliore
+# ACF dei residui del candidato selezionato: controllo visivo che affianca
+# il test formale di Breusch-Godfrey.
+tibble(
+  lag = 1:24,
+  acf = as.numeric(stats::acf(residuals(mod_migliore), lag.max = 24, plot = FALSE)$acf[-1])
+) %>%
+  ggplot(aes(x = lag, y = acf)) +
+  geom_col(width = 0.2) +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = c(-1, 1) * 1.96 / sqrt(nobs(mod_migliore)),
+             linetype = "dashed", color = "blue") +
+  labs(title = paste("ACF dei residui -", nome_migliore),
+       x = "Ritardo (mesi)", y = "ACF") +
+  theme_minimal()
+```
+
+![](05_ecm_files/figure-gfm/acf_residui_migliore-1.png)<!-- -->
+
+**Lettura del grafico.** Quasi tutte le barre restano entro le bande di
+confidenza (±0.113 con 299 osservazioni). La più alta è al **ritardo
+6**, che sfiora la banda superiore e la supera di pochissimo; la seconda
+è al ritardo 9, appena sotto. Con 24 ritardi testati, una o due
+eccedenze marginali sono attese per puro caso al 5%, e il
+Breusch-Godfrey congiunto (p = 0.1417) esclude un problema sistematico.
+
+Il dettaglio più importante è cosa **non** si vede: al ritardo 12 la
+barra è praticamente nulla. La componente stagionale è stata
+completamente assorbita dal termine `d_hicp_it_l12`, che è esattamente
+il suo compito.
+
+``` r
+# Chunk: salvataggio
+# Salviamo i dati con ECT e regressori gia' costruiti (train e test), piu' la
+# griglia di risultati. Il notebook successivo (previsioni e confronto con il
+# benchmark) ripartira' da qui.
+saveRDS(dati_ecm_train,    here("Data", "Processed", "dati_ecm_train.rds"))
+saveRDS(dati_ecm_test,     here("Data", "Processed", "dati_ecm_test.rds"))
+saveRDS(risultati_griglia, here("Data", "Processed", "risultati_griglia_ecm.rds"))
+saveRDS(beta_coint,        here("Data", "Processed", "beta_coint.rds"))
+```
+
+# Sintesi delle decisioni
+
+| Decisione                                                           | Motivazione                                                                                                                                  |
+|---------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| ECT costruito sui livelli, non sulle differenze                     | La deviazione dall’equilibrio di lungo periodo è per definizione una distanza fra livelli                                                    |
+| β stimato solo sul train, ECT calcolato anche sul test              | Applicare un parametro già stimato a dati nuovi non è data leakage; serve per prevedere fuori campione                                       |
+| ECT inserito ritardato di 1 periodo                                 | La correzione risponde a uno squilibrio già osservato; l’ECT contemporaneo creerebbe simultaneità                                            |
+| Campione comune fisso a 299 osservazioni                            | AIC/BIC confrontabili solo a parità di osservazioni; senza questo i modelli con lag 12 avrebbero un vantaggio artificiale                    |
+| Famiglie A e B separate                                             | I regressori contemporanei darebbero all’ECM un vantaggio informativo scorretto nel confronto con il benchmark                               |
+| Selezione = miglior AIC **fra i validi**, non miglior AIC assoluto  | Un modello con residui autocorrelati è mal specificato, e il suo AIC è ingannevole                                                           |
+| Ritardo 12 indispensabile                                           | Tutti i modelli che lo contengono superano il BG (p ≥ 0.106); tutti quelli che non lo contengono lo falliscono (p ≤ 0.0009)                  |
+| Modello selezionato dalla regola: A8_con_brent                      | Miglior AIC fra i cinque candidati validi                                                                                                    |
+| **A5_stagionale portato al confronto fuori campione insieme ad A8** | ΔAIC = 0.76 (sotto la soglia di equivalenza) ma ΔBIC = 6.63 a favore di A5: i due modelli sono indistinguibili in-sample, decide il test set |
+| Inferenza su errori standard HAC, non OLS                           | ARCH-LM rifiuta l’omoschedasticità: Newey-West corregge sia quella sia l’autocorrelazione                                                    |
+| `d_hicp_ea_l1` dichiarato non significativo sotto HAC               | p passa da 0.034 a 0.088: il canale di breve periodo è fragile, quello di lungo periodo no                                                   |
+
+# Prossimo passo
+
+Nel notebook successivo: previsioni di **A8_con_brent** e
+**A5_stagionale**, confrontate con i due benchmark ARIMA del notebook 04
+e con un random walk, sul test set (gennaio 2023 – agosto 2026, 44
+osservazioni). È il momento decisivo del progetto — se un modello che
+guarda all’Europa, al petrolio e rientra nell’equilibrio di lungo
+periodo batte un modello che guarda solo alla propria storia, la tesi ha
+dimostrato il suo punto.

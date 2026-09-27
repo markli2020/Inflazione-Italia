@@ -1,7 +1,7 @@
 ---
 title: "03 - Test di Cointegrazione (Johansen)"
 subtitle: "Inflazione Italia - Analisi Econometrica"
-output: html_document
+output: github_document
 ---
 
 ```{r setup, include=FALSE}
@@ -187,7 +187,7 @@ Esiste **una sola** relazione di equilibrio di lungo periodo fra `hicp_it`,
 
 Il salto fra le due statistiche (58.72 contro 8.75) è netto: non siamo in una
 situazione ambigua in cui il rango potrebbe plausibilmente essere 2. La riga
-`r ≤ 2` viene stampata per completezza dall'algoritmo ma non aggiunge
+*rango ≤ 2* viene stampata per completezza dall'algoritmo ma non aggiunge
 informazione: con tre variabili il rango massimo possibile è 2, e quella riga
 andrebbe consultata solo se la precedente fosse stata rifiutata.
 
@@ -205,6 +205,15 @@ esecuzioni è informativo:
 | Coefficiente `hicp_ea` | −1.3671 | −1.3681 | **−1.3431** |
 | Coefficiente `log_brent` | +0.2216 | +0.2723 | **+0.2912** |
 | Velocità di correzione (`hicp_it`) | −0.2112 | −0.2178 | **−0.2232** |
+
+**Nota sulla riproducibilità di questa tabella.** Solo l'ultima colonna è
+riproducibile eseguendo questo notebook: è il risultato che il chunk qui sopra
+ha appena prodotto. Le prime due provengono da esecuzioni precedenti del
+progetto, su versioni dei dati che non sono più nella cartella `Data/Raw` — il
+Brent ancora in dollari nella prima, la vecchia serie HICP del dataset ICP
+della BCE nella seconda. Sono valori realmente ottenuti e annotati al momento,
+non stime a posteriori, ma chi clona il repository oggi otterrà giustamente
+soltanto la terza colonna.
 
 Il rango è sempre 1, e le due grandezze economicamente più importanti — il
 coefficiente di lungo periodo sull'inflazione europea e la velocità di
